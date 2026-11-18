@@ -1,0 +1,255 @@
+<!doctype html>
+<html lang="es">
+<head>
+<meta charset="utf-8">
+<title>Presentación: propensión de compra y pricing</title>
+<style>
+  @page { size: 13.333in 7.5in; margin: 0; }
+  :root { --tinta: #22211f; --suave: #5b5a56; --linea: #dcdad4; --azul: #2a78d6; --naranja: #eb6834; --verde: #1baf7a; --fondo: #f4f3ef; }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; padding: 0; background: #fff; }
+  body { font-family: "Segoe UI", Arial, sans-serif; color: var(--tinta); }
+  .slide { width: 13.333in; height: 7.5in; padding: 0.45in 0.6in 0.4in; position: relative; overflow: hidden; break-after: page; display: flex; flex-direction: column; }
+  .slide:last-child { break-after: auto; }
+  .etiqueta { font-size: 11pt; font-weight: 600; color: var(--azul); text-transform: uppercase; letter-spacing: 1pt; margin-bottom: 4pt; }
+  h1 { font-size: 25pt; line-height: 1.15; margin: 0 0 14pt; letter-spacing: -0.3pt; }
+  h2 { font-size: 14pt; margin: 0 0 6pt; }
+  p, li { font-size: 13.5pt; line-height: 1.4; }
+  p { margin: 0 0 8pt; }
+  ul { margin: 0; padding-left: 16pt; }
+  li { margin-bottom: 6pt; }
+  .pie { position: absolute; bottom: 0.2in; left: 0.6in; right: 0.6in; font-size: 9pt; color: var(--suave); display: flex; justify-content: space-between; border-top: 0.6pt solid var(--linea); padding-top: 4pt; }
+  .fila { display: flex; gap: 0.35in; flex: 1; min-height: 0; }
+  .col { flex: 1; min-width: 0; }
+  .col img { width: 100%; display: block; }
+  .kpis { display: flex; gap: 12pt; margin-top: 8pt; }
+  .kpi { flex: 1; background: var(--fondo); border-radius: 6pt; padding: 12pt 14pt; }
+  .kpi b { display: block; font-size: 28pt; color: var(--azul); line-height: 1.1; }
+  .kpi span { font-size: 11pt; color: var(--suave); }
+  table { border-collapse: collapse; width: 100%; font-size: 12.5pt; }
+  th, td { border-bottom: 0.7pt solid var(--linea); padding: 6pt 8pt; text-align: left; }
+  th { background: var(--fondo); font-weight: 600; }
+  td.n, th.n { text-align: right; font-variant-numeric: tabular-nums; white-space: nowrap; }
+  tr.d td { font-weight: 700; color: var(--azul); }
+  .caja { background: var(--fondo); border-left: 4pt solid var(--azul); padding: 9pt 12pt; border-radius: 0 6pt 6pt 0; }
+  .caja.alerta { border-left-color: var(--naranja); }
+  .flujo { display: flex; align-items: stretch; gap: 8pt; margin-bottom: 14pt; }
+  .paso { flex: 1; border: 1pt solid var(--linea); border-top: 4pt solid var(--azul); border-radius: 6pt; padding: 8pt 10pt; }
+  .paso b { display: block; font-size: 12pt; margin-bottom: 3pt; }
+  .paso span { font-size: 11.5pt; color: var(--suave); line-height: 1.35; display: block; }
+  .flecha { align-self: center; color: var(--suave); font-size: 18pt; }
+  .gantt { width: 100%; border-collapse: collapse; font-size: 12pt; }
+  .gantt td, .gantt th { border-bottom: 0.7pt solid var(--linea); padding: 8pt 5pt; }
+  .gantt th.s { text-align: center; width: 0.48in; font-weight: 600; }
+  .gantt td.on { background: var(--azul); }
+  .gantt td.on2 { background: var(--verde); }
+  .grande { font-size: 15pt; }
+</style>
+</head>
+<body>
+
+<!-- 1. Objetivos -->
+<section class="slide">
+  <div class="etiqueta">Objetivos</div>
+  <h1>Anticipar quién comprará, qué marca y cómo responde al precio, para decidir a quién ofrecer y cómo fijar precios</h1>
+  <div class="fila">
+    <div class="col">
+      <h2>Objetivos de la solución</h2>
+      <ul>
+        <li><b>Propensión:</b> estimar en cada visita la probabilidad de compra y la de cada una de las 5 marcas.</li>
+        <li><b>Pricing:</b> medir la elasticidad de la compra al precio por segmento y por marca.</li>
+        <li><b>Valor:</b> convertir los modelos en decisiones de priorización, precio y descuentos, con indicadores medibles.</li>
+      </ul>
+      <p style="margin-top:10pt; color: var(--suave); font-size: 11pt;">Datos: 58,693 visitas de 500 clientes durante 730 días, con precios y promociones diarias de 5 marcas.</p>
+    </div>
+    <div class="col">
+      <h2>Resultados principales (últimos 6 meses, no usados para construir)</h2>
+      <div class="kpis">
+        <div class="kpi"><b>51.4&nbsp;%</b><span>de compra en el 20&nbsp;% de visitas mejor puntuadas, frente a 25.2&nbsp;% al azar</span></div>
+        <div class="kpi"><b>0.448</b><span>Gini del modelo de propensión, con solo 4 variables</span></div>
+      </div>
+      <div class="kpis">
+        <div class="kpi"><b>−3.3</b><span>elasticidad de corto plazo de la compra al precio de la categoría</span></div>
+        <div class="kpi"><b>78.5&nbsp;%</b><span>de las compras son de la marca que el cliente ya prefería</span></div>
+      </div>
+    </div>
+  </div>
+  <div class="pie"><span>Propensión de compra y pricing</span><span>1 / 7</span></div>
+</section>
+
+<!-- 2. EDA -->
+<section class="slide">
+  <div class="etiqueta">Análisis exploratorio</div>
+  <h1>La historia del cliente explica la compra más que el precio o el perfil, y el diccionario de datos tenía errores</h1>
+  <div class="fila">
+    <div class="col" style="flex:1.25"><img src="../../img/eda_patrones.png" alt="Patrones de compra"></div>
+    <div class="col">
+      <h2>Patrones clave</h2>
+      <ul>
+        <li><b>Historia:</b> tras una visita con compra se compra 41&nbsp;% de las veces; tras una sin compra, 20&nbsp;%. El 10&nbsp;% de clientes concentra 32&nbsp;% de las compras.</li>
+        <li><b>Precio y promociones:</b> la compra cae de 28&nbsp;% a 22&nbsp;% entre los días más baratos y los más caros.</li>
+        <li><b>Marcas:</b> la más cara (5) es la más comprada (34&nbsp;%).</li>
+      </ul>
+      <h2 style="margin-top:8pt">Anomalías detectadas</h2>
+      <div class="caja alerta">
+        <ul>
+          <li>Dos columnas no contienen lo que dice el diccionario: <i>última marca</i> es la de la visita anterior, y <i>última cantidad</i> es un 0/1.</li>
+          <li>Los últimos 3 días tienen 0 compras en 139 visitas: registro incompleto, excluido.</li>
+        </ul>
+      </div>
+    </div>
+  </div>
+  <div class="pie"><span>Propensión de compra y pricing</span><span>2 / 7</span></div>
+</section>
+
+<!-- 3. Metodología -->
+<section class="slide">
+  <div class="etiqueta">Metodología de la solución</div>
+  <h1>Tres modelos que responden tres preguntas, validados como se usarán: entrenando con el pasado y evaluando el futuro</h1>
+  <div class="flujo">
+    <div class="paso"><b>1. Datos y variables</b><span>Calidad, limpieza y 30 variables calculadas solo con visitas anteriores</span></div>
+    <div class="flecha">›</div>
+    <div class="paso"><b>2. Segmentación</b><span>K-Means sobre el perfil; 3 segmentos elegidos por estabilidad</span></div>
+    <div class="flecha">›</div>
+    <div class="paso"><b>3. Selección</b><span>Concentración, PSI, IV, Gini, signo y correlación: quedan 8 de 30</span></div>
+    <div class="flecha">›</div>
+    <div class="paso"><b>4. Modelos y ajuste fino</b><span>Regla, logística, LightGBM y XGBoost con búsqueda de hiperparámetros</span></div>
+    <div class="flecha">›</div>
+    <div class="paso"><b>5. Explicabilidad</b><span>SHAP, odds ratios y revisión de equidad</span></div>
+  </div>
+  <div class="fila">
+    <div class="col">
+      <table>
+        <tr><th>Pregunta</th><th>Modelo</th></tr>
+        <tr><td>¿Comprará en esta visita?</td><td>XGBoost ajustado (propensión)</td></tr>
+        <tr><td>¿Qué marca elegirá?</td><td>Logística multinomial (precios + lealtad)</td></tr>
+        <tr><td>¿Cuánto responde al precio?</td><td>Logística de respuesta al precio por segmento</td></tr>
+      </table>
+      <p style="margin-top:8pt"><b>P(compra de la marca j) = P(compra) × P(marca j | compra)</b></p>
+    </div>
+    <div class="col">
+      <div class="caja">
+        <ul>
+          <li><b>Validación temporal:</b> 3 bloques de desarrollo para elegir y los últimos 6 meses (13,331 visitas) para la prueba final.</li>
+          <li><b>Elección con regla fija:</b> el modelo más simple a menos de 0.01 de Gini del mejor.</li>
+          <li><b>Intervalos de confianza:</b> remuestreo de clientes para el modelo y de días para la elasticidad.</li>
+        </ul>
+      </div>
+    </div>
+  </div>
+  <div class="pie"><span>Propensión de compra y pricing</span><span>3 / 7</span></div>
+</section>
+
+<!-- 4. Resultados del modelo -->
+<section class="slide">
+  <div class="etiqueta">Resultados del modelo de propensión</div>
+  <h1>Un modelo de 4 variables de historia rinde igual o mejor que uno de 30 y duplica la tasa de compra en el cupo</h1>
+  <div class="fila">
+    <div class="col" style="flex:1.2">
+      <table>
+        <tr><th>Modelo</th><th class="n">Variables</th><th class="n">Gini (IC 95&nbsp;%)</th><th class="n">Compra en el 20&nbsp;%</th></tr>
+        <tr class="d"><td>Elegido: XGBoost</td><td class="n">4</td><td class="n">0.448 (0.41–0.49)</td><td class="n">51.4&nbsp;%</td></tr>
+        <tr><td>LightGBM</td><td class="n">4</td><td class="n">0.451 (0.41–0.49)</td><td class="n">51.3&nbsp;%</td></tr>
+        <tr><td>LightGBM, 30 variables</td><td class="n">30</td><td class="n">0.440 (0.40–0.48)</td><td class="n">51.1&nbsp;%</td></tr>
+        <tr><td>Campeón: logística</td><td class="n">30</td><td class="n">0.405 (0.36–0.45)</td><td class="n">50.0&nbsp;%</td></tr>
+        <tr><td>Regla: tasa histórica</td><td class="n">1</td><td class="n">0.371 (0.32–0.42)</td><td class="n">48.4&nbsp;%</td></tr>
+        <tr><td>Azar</td><td class="n">0</td><td class="n">0</td><td class="n">25.2&nbsp;%</td></tr>
+      </table>
+      <ul style="margin-top:12pt">
+        <li><b>Por qué menos es más:</b> las variables de precio cambian por épocas (PSI de hasta 10.5). Agregarlas baja el Gini a 0.431.</li>
+        <li><b>XGBoost y LightGBM empatan</b> una vez ajustados (ambos con ajuste fino); sin ajuste, XGBoost queda muy atrás.</li>
+        <li><b>Confiable y explicable:</b> calibrado (predice y ocurre 25.2&nbsp;%), estable con clientes nuevos; dominan la tasa histórica y los días desde la última compra.</li>
+      </ul>
+    </div>
+    <div class="col"><img src="../../img/curva_ganancia_oot.png" alt="Curva de ganancia"></div>
+  </div>
+  <div class="pie"><span>Propensión de compra y pricing</span><span>4 / 7</span></div>
+</section>
+
+<!-- 5. Pricing -->
+<section class="slide">
+  <div class="etiqueta">Modelos de pricing</div>
+  <h1>La compra responde al precio, pero no por igual: dos segmentos y la marca más barata son muy sensibles, la marca premium casi nada</h1>
+  <div class="fila">
+    <div class="col" style="flex:1.3">
+      <img src="../../img/elasticidad_segmentos.png" alt="Elasticidad por segmento">
+      <div class="caja alerta" style="margin-top:10pt">
+        <p style="margin:0; font-size:11.5pt"><b>Prueba de nivel:</b> en los últimos 6 meses el precio subió 2.8&nbsp;% y la compra no cayó. La elasticidad de −3.3 mide la respuesta de corto plazo (en qué día comprar), no la de un cambio sostenido.</p>
+      </div>
+    </div>
+    <div class="col">
+      <table>
+        <tr><th>Marca</th><th class="n">Participación</th><th class="n">Elasticidad a su precio</th></tr>
+        <tr><td>1 (la más barata)</td><td class="n">9&nbsp;%</td><td class="n">−6.8</td></tr>
+        <tr><td>2</td><td class="n">31&nbsp;%</td><td class="n">−2.4</td></tr>
+        <tr><td>3</td><td class="n">6&nbsp;%</td><td class="n">No identificable</td></tr>
+        <tr><td>4</td><td class="n">20&nbsp;%</td><td class="n">−2.1</td></tr>
+        <tr class="d"><td>5 (la más cara)</td><td class="n">34&nbsp;%</td><td class="n">−0.5</td></tr>
+      </table>
+      <ul style="margin-top:12pt">
+        <li>La marca 1 le quita clientes sobre todo a la marca 2.</li>
+        <li>Mayores de mayor ingreso: elasticidad de −0.6, frente a −3.7 y −4.2 en los otros dos segmentos.</li>
+      </ul>
+    </div>
+  </div>
+  <div class="pie"><span>Propensión de compra y pricing</span><span>5 / 7</span></div>
+</section>
+
+<!-- 6. Captura de valor -->
+<section class="slide">
+  <div class="etiqueta">Captura de valor</div>
+  <h1>El valor está en dirigir mejor, no en descontar más: ofrecer a quien ya iba a comprar destruye margen</h1>
+  <div class="fila">
+    <div class="col">
+      <h2>Descuento de 5&nbsp;% al 20&nbsp;% de las visitas (margen ilustrativo de 30&nbsp;%)</h2>
+      <table>
+        <tr><th>Estrategia</th><th class="n">Compras extra</th><th class="n">Subsidiadas</th><th class="n">Margen</th></tr>
+        <tr><td>Mayor propensión</td><td class="n">113</td><td class="n">1,473</td><td class="n">−272</td></tr>
+        <tr><td>Mayor aumento de probabilidad</td><td class="n">166</td><td class="n">1,008</td><td class="n">−50</td></tr>
+        <tr class="d"><td>Mayor margen incremental</td><td class="n">111</td><td class="n">420</td><td class="n">+37</td></tr>
+        <tr><td>Al azar</td><td class="n">95</td><td class="n">683</td><td class="n">−66</td></tr>
+      </table>
+      <ul style="margin-top:10pt">
+        <li><b>Precio general:</b> bajarlo 5&nbsp;% sube las compras 14&nbsp;% pero baja el margen 5&nbsp;%.</li>
+        <li><b>Priorizar:</b> con el 20&nbsp;% de las visitas se alcanza el 41&nbsp;% de las compras.</li>
+      </ul>
+    </div>
+    <div class="col">
+      <h2>Impacto por área e indicadores</h2>
+      <table>
+        <tr><th>Área</th><th>Indicador de captura de valor</th></tr>
+        <tr><td>Marketing y CRM</td><td>Margen incremental por oferta frente a un grupo de control</td></tr>
+        <tr><td>Pricing</td><td>Margen bruto y participación por marca</td></tr>
+        <tr><td>Inventario</td><td>Error de la demanda semanal, quiebres de stock</td></tr>
+        <tr><td>Finanzas</td><td>Retorno de la inversión en descuentos</td></tr>
+        <tr><td>Ciencia de datos</td><td>Gini, PSI del score, calibración</td></tr>
+      </table>
+      <div class="caja" style="margin-top:10pt"><p style="margin:0; font-size:11.5pt">Todo valor se confirma con un <b>grupo de control aleatorio</b> (10&nbsp;% de las visitas elegibles sin oferta).</p></div>
+    </div>
+  </div>
+  <div class="pie"><span>Propensión de compra y pricing</span><span>6 / 7</span></div>
+</section>
+
+<!-- 7. Cronograma -->
+<section class="slide">
+  <div class="etiqueta">Cronograma de trabajo (propuesta)</div>
+  <h1>En 5 semanas el modelo puede estar en piloto, y en 13 semanas el valor estará medido con grupo de control</h1>
+  <table class="gantt">
+    <tr><th>Fase</th><th>Entregable</th>
+      <th class="s">S1</th><th class="s">S2</th><th class="s">S3</th><th class="s">S4</th><th class="s">S5</th><th class="s">S6</th><th class="s">S7–S9</th><th class="s">S10–S13</th></tr>
+    <tr><td>Entendimiento y calidad de datos</td><td>Diccionario corregido y reglas de calidad</td><td class="on"></td><td></td><td></td><td></td><td></td><td></td><td></td><td></td></tr>
+    <tr><td>Análisis exploratorio y variables</td><td>Variables sin fuga y segmentación</td><td></td><td class="on"></td><td></td><td></td><td></td><td></td><td></td><td></td></tr>
+    <tr><td>Modelos, pricing y elección de marca</td><td>Modelo elegido, ficha y elasticidades</td><td></td><td></td><td class="on"></td><td class="on"></td><td></td><td></td><td></td><td></td></tr>
+    <tr><td>Despliegue piloto en la nube</td><td>Puntuación diaria y tablero de monitoreo</td><td></td><td></td><td></td><td></td><td class="on"></td><td></td><td></td><td></td></tr>
+    <tr><td>Piloto con grupo de control</td><td>Margen incremental medido</td><td></td><td></td><td></td><td></td><td></td><td class="on2"></td><td class="on2"></td><td class="on2"></td></tr>
+    <tr><td>Prueba de precio controlada (marca 5)</td><td>Elasticidad sostenida medida</td><td></td><td></td><td></td><td></td><td></td><td></td><td class="on2"></td><td class="on2"></td></tr>
+  </table>
+  <div class="fila" style="margin-top:14pt">
+    <div class="col"><div class="caja"><p style="margin:0"><b>Próximos pasos:</b> el modelo ya está guardado y <code>puntuar.py</code> lo ejecuta fuera del notebook. Falta programarlo como lote nocturno en la nube (SageMaker, Azure ML o Vertex AI) y lanzar el piloto de descuentos focalizados.</p></div></div>
+    <div class="col"><div class="caja alerta"><p style="margin:0"><b>Monitoreo:</b> PSI del score mensual (&gt; 0.25 reentrenar), sesgo de demanda semanal (&gt; 10&nbsp;% recalibrar) y margen del grupo tratado frente al control por campaña.</p></div></div>
+  </div>
+  <div class="pie"><span>Propensión de compra y pricing</span><span>7 / 7</span></div>
+</section>
+
+</body>
+</html>

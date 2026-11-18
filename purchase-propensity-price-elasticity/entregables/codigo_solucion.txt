@@ -1,0 +1,1400 @@
+# ==================================================================================================
+# Código de la solución: propensión de compra, elección de marca y elasticidad de precio
+# Parte 1: celdas de código de nb_01_propension_elasticidad.ipynb, en orden
+# Parte 2: puntuar.py, script de puntuación fuera del notebook
+# Dependencias: requirements_purchase-propensity-price-elasticity.txt (versiones exactas, Python 3.14)
+# Datos: data/compras_data.csv o junto al notebook | Ejecución: todas las celdas, unos 3 minutos, SEMILLA = 42
+# ==================================================================================================
+
+# ##################################################################################################
+# PARTE 1. NOTEBOOK
+# ##################################################################################################
+
+# ==================================================================================================
+# Propensión de compra y elasticidad de precio
+# ==================================================================================================
+
+# ==================================================================================================
+# Resumen ejecutivo
+# ==================================================================================================
+
+# ==================================================================================================
+# Guía de lectura
+# ==================================================================================================
+
+# --- Glosario rápido ---
+
+# ==================================================================================================
+# 1. Definición del problema y configuración
+# ==================================================================================================
+
+# [Celda 1]
+from dataclasses import dataclass
+from pathlib import Path
+import warnings
+
+import joblib
+import matplotlib.pyplot as plt
+from matplotlib.patches import Patch
+import numpy as np
+import pandas as pd
+from IPython.display import display
+from lightgbm import LGBMClassifier
+from sklearn.cluster import KMeans
+from sklearn.compose import ColumnTransformer
+from sklearn.linear_model import LogisticRegression
+from sklearn.metrics import adjusted_rand_score, average_precision_score, brier_score_loss, log_loss, roc_auc_score, silhouette_score
+from sklearn.model_selection import StratifiedKFold
+from sklearn.pipeline import make_pipeline
+from sklearn.preprocessing import OneHotEncoder, StandardScaler
+from xgboost import XGBClassifier
+
+warnings.filterwarnings('ignore')
+pd.set_option('display.max_columns', 40, 'display.max_rows', 120, 'display.width', 200)
+Path('img').mkdir(exist_ok=True)
+
+# [Celda 2]
+AZUL, NARANJA, VERDE, GRIS, TINTA = '#2a78d6', '#eb6834', '#1baf7a', '#8b8a84', '#52514e'
+plt.rcParams.update({
+    'figure.dpi': 110, 'font.size': 10, 'axes.spines.top': False, 'axes.spines.right': False,
+    'axes.grid': True, 'grid.color': '#e8e7e3', 'grid.linewidth': 0.8, 'axes.axisbelow': True,
+    'axes.edgecolor': '#9a9892', 'axes.labelcolor': TINTA, 'xtick.color': TINTA, 'ytick.color': TINTA,
+    'axes.titlelocation': 'left', 'axes.titleweight': 'bold', 'lines.linewidth': 2, 'legend.frameon': False,
+})
+
+SEMILLA = 42
+
+# [Celda 3]
+def pct(x, d=1):
+    return f'{100 * x:.{d}f} %'
+
+def gini(y_r, s):
+    return 2 * roc_auc_score(y_r, s) - 1
+
+def tasa_cupo(y_r, s, cupo, sorteos=50, semilla=SEMILLA):
+    """Tasa de compra en el cupo. Si hay empates, promedia varios sorteos."""
+    rng = np.random.default_rng(semilla)
+    k = max(1, int(len(s) * cupo))
+    n_sorteos = 1 if len(np.unique(s)) == len(s) else sorteos
+    return float(np.mean([y_r[np.lexsort((rng.random(len(s)), -s))[:k]].mean() for _ in range(n_sorteos)]))
+
+# ==================================================================================================
+# 2. Calidad de datos
+# ==================================================================================================
+
+# [Celda 4]
+candidatas = [Path('data/compras_data.csv'), Path('compras_data.csv')]
+ruta = next(p for p in candidatas if p.is_file())
+crudo = pd.read_csv(ruta).sort_values(['id', 'dia_visita'], kind='stable').reset_index(drop=True)
+assert crudo.shape == (58693, 24), 'El archivo no coincide con la versión esperada'
+
+MARCAS = range(1, 6)
+PRECIOS = [f'precio_marca_{m}' for m in MARCAS]
+PROMOS = [f'promo_marca_{m}' for m in MARCAS]
+DEMO = ['genero', 'estado_civil', 'edad', 'nivel_educacion', 'ingreso_anual', 'ocupacion']
+
+# [Celda 5]
+g = crudo.groupby('id')
+compra = crudo['incidencia_compra'] == 1
+calidad = pd.DataFrame({'Resultado': {
+    'Filas | clientes | días con visitas': f'{len(crudo):,} | {crudo["id"].nunique()} | {crudo["dia_visita"].nunique()}',
+    'Valores nulos': int(crudo.isna().sum().sum()),
+    'Filas duplicadas | visitas repetidas de un cliente en un día':
+        f'{int(crudo.duplicated().sum())} | {int(crudo.duplicated(["id", "dia_visita"]).sum())}',
+    'Compras sin marca o sin cantidad':
+        int((compra != (crudo['id_marca'] > 0)).sum() + (compra != (crudo['cantidad'] > 0)).sum()),
+    'Precio y promoción iguales para todos los clientes del día':
+        bool((crudo.groupby('dia_visita')[PRECIOS + PROMOS].nunique() == 1).all().all()),
+    'ultima_marca_comprada = marca de la visita anterior':
+        pct((crudo['ultima_marca_comprada'] == g['id_marca'].shift().fillna(0)).mean()),
+    'ultima_cantidad_comprada = hubo compra en la visita anterior (0 o 1)':
+        pct((crudo['ultima_cantidad_comprada'] == g['incidencia_compra'].shift().fillna(0)).mean()),
+    'ultima_cantidad_comprada = cantidad de la visita anterior':
+        pct((crudo['ultima_cantidad_comprada'] == g['cantidad'].shift().fillna(0)).mean()),
+    'Tasa de compra': pct(crudo['incidencia_compra'].mean()),
+}})
+calidad
+
+# --- Los últimos días del archivo ---
+
+# [Celda 6]
+por_dia = crudo.groupby('dia_visita')['incidencia_compra'].agg(visitas='size', compras='sum', tasa='mean')
+display(por_dia.tail(8).assign(tasa=lambda t: t['tasa'].map(pct)).T)
+
+# El último día con alguna compra marca el fin del registro confiable
+ultimo_con_compras = int(por_dia.index[por_dia['compras'] > 0].max())
+cola = crudo['dia_visita'] > ultimo_con_compras
+tasa_global = crudo.loc[~cola, 'incidencia_compra'].mean()
+print(f'Último día con compras: {ultimo_con_compras} | visitas posteriores: {int(cola.sum())}, '
+      f'con {int(crudo.loc[cola, "incidencia_compra"].sum())} compras')
+print(f'Probabilidad de ver 0 compras en {int(cola.sum())} visitas con una tasa de {pct(tasa_global)}: '
+      f'{(1 - tasa_global) ** int(cola.sum()):.1e}')
+
+# [Celda 7]
+DIA_FINAL = ultimo_con_compras     # Último día confiable: los días posteriores tienen visitas, pero no compras registradas
+df = crudo[crudo['dia_visita'] <= DIA_FINAL].reset_index(drop=True)
+print(f'DIA_FINAL = {DIA_FINAL} | visitas para el análisis: {len(df):,}')
+
+# ==================================================================================================
+# 3. Diseño temporal de las muestras
+# ==================================================================================================
+
+# [Celda 8]
+# Historia de cada visita calculada solo con visitas anteriores, sin ningún parámetro.
+# Sirve para diseñar las muestras; las variables definitivas se construyen en el capítulo siguiente.
+g = df.groupby('id')
+historia = pd.DataFrame({
+    'dia_visita': df['dia_visita'],
+    'id': df['id'],
+    'compra': df['incidencia_compra'],
+    'visitas_previas': g.cumcount(),
+    'compras_previas': g['incidencia_compra'].cumsum() - df['incidencia_compra'],
+})
+historia['tasa_cruda'] = (historia['compras_previas'] / historia['visitas_previas']).fillna(0)
+
+def en_rango(desde, hasta):
+    return ((historia['dia_visita'] >= desde) & (historia['dia_visita'] <= hasta)).to_numpy()
+
+# --- 3.1. ¿Cuántos días reservar para la prueba final? ---
+
+# [Celda 9]
+rng = np.random.default_rng(SEMILLA)
+
+def ancho_ic_gini(mask, n=300):
+    """Ancho del IC 95 % del Gini de la regla simple, remuestreando clientes completos."""
+    ids = historia.loc[mask, 'id'].to_numpy()
+    y_m, s_m = historia.loc[mask, 'compra'].to_numpy(), historia.loc[mask, 'tasa_cruda'].to_numpy()
+    grupos = [np.flatnonzero(ids == c) for c in np.unique(ids)]
+    ginis = [gini(y_m[i], s_m[i]) for i in
+             (np.concatenate([grupos[j] for j in rng.integers(0, len(grupos), len(grupos))]) for _ in range(n))]
+    return np.percentile(ginis, 97.5) - np.percentile(ginis, 2.5)
+
+filas = []
+for meses in (3, 6, 9):
+    inicio = DIA_FINAL - 30 * meses + 1
+    m = en_rango(inicio, DIA_FINAL)
+    filas.append({'Prueba final': f'Últimos {meses} meses', 'Desde el día': inicio, 'Visitas de prueba': int(m.sum()),
+                  'Ancho del IC 95 % del Gini': round(ancho_ic_gini(m), 3),
+                  'Visitas para construir': int((historia['dia_visita'] < inicio).sum())})
+pd.DataFrame(filas).set_index('Prueba final')
+
+# [Celda 10]
+MESES_OOT = 6                                  # Elegido en la sección 3.1
+INICIO_OOT = DIA_FINAL - 30 * MESES_OOT + 1
+print(f'INICIO_OOT = {INICIO_OOT}: los días {INICIO_OOT} a {DIA_FINAL} se reservan para la prueba final')
+
+# --- 3.2. ¿Desde cuándo la historia de los clientes es confiable? ---
+
+# [Celda 11]
+trimestre = (historia['dia_visita'] - 1) // 91 + 1
+madurez = historia.groupby(trimestre).agg(
+    Días=('dia_visita', lambda d: f'{d.min()} a {d.max()}'),
+    Visitas=('compra', 'size'),
+    **{'Tasa de compra': ('compra', 'mean')},
+    **{'Visitas previas (mediana)': ('visitas_previas', 'median')},
+    **{'% sin compras previas': ('compras_previas', lambda c: (c == 0).mean())},
+)
+madurez.index.name = 'Trimestre'
+madurez.assign(**{c: madurez[c].map(pct) for c in ['Tasa de compra', '% sin compras previas']})
+
+# [Celda 12]
+MAX_SIN_COMPRAS = 0.10          # Un trimestre es maduro si menos del 10 % de sus visitas son de clientes sin compras previas
+TRIMESTRES_MADUROS_MIN = 2      # El primer modelo entrena con al menos 2 trimestres maduros (6 meses)
+
+pct_sin_compras = historia.groupby(trimestre)['compras_previas'].apply(lambda c: (c == 0).mean())
+primer_maduro = pct_sin_compras.index[pct_sin_compras < MAX_SIN_COMPRAS][0]
+DIAS_ARRANQUE = 91 * (primer_maduro - 1)                            # Días de apertura, antes del primer trimestre maduro
+INICIO_DESARROLLO = 91 * (primer_maduro - 1 + TRIMESTRES_MADUROS_MIN) + 1
+print(f'Primer trimestre maduro: {primer_maduro} | DIAS_ARRANQUE = {DIAS_ARRANQUE} | '
+      f'el desarrollo empieza el día {INICIO_DESARROLLO}')
+
+# --- 3.3. ¿En cuántos bloques se divide el desarrollo? ---
+
+# [Celda 13]
+def bloques_iguales(inicio, fin, k):
+    """Divide los días de inicio a fin en k bloques consecutivos de tamaño casi igual."""
+    partes = np.array_split(np.arange(inicio, fin + 1), k)
+    return [(int(p[0]), int(p[-1])) for p in partes]
+
+filas = []
+for k in (2, 3, 4, 5):
+    bloques = bloques_iguales(INICIO_DESARROLLO, INICIO_OOT - 1, k)
+    ginis = [gini(historia.loc[en_rango(d, h), 'compra'], historia.loc[en_rango(d, h), 'tasa_cruda']) for d, h in bloques]
+    filas.append({'Bloques': k, 'Días por bloque': round((INICIO_OOT - INICIO_DESARROLLO) / k),
+                  'Visitas por bloque (mín.)': min(int(en_rango(d, h).sum()) for d, h in bloques),
+                  'Gini medio': np.mean(ginis), 'Desviación entre bloques': np.std(ginis, ddof=1)})
+comparacion = pd.DataFrame(filas).set_index('Bloques')
+comparacion.round(3)
+
+# [Celda 14]
+MIN_BLOQUES = 3   # Con menos de 3 bloques, la desviación del Gini no es confiable
+k_elegido = int(comparacion.loc[comparacion.index >= MIN_BLOQUES, 'Desviación entre bloques'].idxmin())
+BLOQUES_MODELAMIENTO = bloques_iguales(INICIO_DESARROLLO, INICIO_OOT - 1, k_elegido)
+print(f'BLOQUES_MODELAMIENTO = {BLOQUES_MODELAMIENTO}')
+
+# Funciones que usan los capítulos siguientes para separar entrenamiento y evaluación
+def mascara(desde, hasta):
+    return ((df['dia_visita'] >= desde) & (df['dia_visita'] <= hasta)).to_numpy()
+
+def mascara_train(inicio):
+    return (df['dia_visita'] < inicio).to_numpy()
+
+# ==================================================================================================
+# 4. Variables sin fuga de información
+# ==================================================================================================
+
+# --- 4.1. ¿Cuál es el tope de días desde la última compra? ---
+
+# [Celda 15]
+dia_ultima_compra = df['dia_visita'].where(df['incidencia_compra'] == 1).groupby(df['id']).transform(lambda s: s.ffill().shift())
+historia['dias_desde_compra'] = historia['dia_visita'] - dia_ultima_compra       # Vacío si el cliente aún no compró
+en_desarrollo = historia['dia_visita'] < INICIO_OOT
+con_compra = en_desarrollo & historia['dias_desde_compra'].notna()
+
+tramos = pd.cut(historia.loc[con_compra, 'dias_desde_compra'], [0, 7, 14, 30, 60, 90, 120, 180, 400])
+respuesta = historia.loc[con_compra].groupby(tramos, observed=True)['compra'].agg(Visitas='size', **{'Tasa de compra': 'mean'})
+respuesta['% de visitas'] = respuesta['Visitas'] / respuesta['Visitas'].sum()
+percentiles = historia.loc[con_compra, 'dias_desde_compra'].quantile([0.50, 0.90, 0.95, 0.99])
+print('Días desde la última compra, percentiles:', {f'p{int(q * 100)}': int(v) for q, v in percentiles.items()})
+respuesta.assign(**{c: respuesta[c].map(pct) for c in ['Tasa de compra', '% de visitas']})
+
+# [Celda 16]
+DIAS_MAX = int(percentiles[0.95] // 30 * 30)     # Percentil 95, redondeado hacia abajo a un múltiplo de 30 días
+print(f'DIAS_MAX = {DIAS_MAX}')
+
+# --- 4.2. ¿Cuántas visitas ficticias suavizan la tasa histórica? ---
+
+# [Celda 17]
+PRIOR = historia.loc[historia['dia_visita'] < INICIO_DESARROLLO, 'compra'].mean()
+evaluacion = en_rango(INICIO_DESARROLLO, INICIO_OOT - 1)
+
+filas = []
+for m in (0, 1, 2, 5, 10, 20, 50):
+    tasa = ((historia['compras_previas'] + m * PRIOR) / (historia['visitas_previas'] + m)).fillna(PRIOR)
+    filas.append({'Visitas ficticias (m)': m,
+                  'Brier': brier_score_loss(historia.loc[evaluacion, 'compra'], tasa[evaluacion]),
+                  'Gini': gini(historia.loc[evaluacion, 'compra'], tasa[evaluacion])})
+suavizado = pd.DataFrame(filas).set_index('Visitas ficticias (m)')
+print(f'Tasa inicial p0 (días 1 a {INICIO_DESARROLLO - 1}): {pct(PRIOR)}')
+suavizado.round(5)
+
+# [Celda 18]
+SUAVIZADO = int(suavizado['Brier'].idxmin())     # El número de visitas ficticias con menor Brier en desarrollo
+print(f'SUAVIZADO = {SUAVIZADO}')
+
+# --- 4.3. Construcción de las variables ---
+
+# [Celda 19]
+def construir_variables(d, prior=PRIOR):
+    d = d.sort_values(['id', 'dia_visita'], kind='stable').reset_index(drop=True)
+    g = d.groupby('id')
+    d['precio_medio'] = d[PRECIOS].mean(axis=1)
+    d['n_promos'] = d[PROMOS].sum(axis=1)
+    d['compro_visita_anterior'] = d['ultima_cantidad_comprada']
+    d['n_visitas_previas'] = g.cumcount()
+    d['compras_previas'] = g['incidencia_compra'].cumsum() - d['incidencia_compra']
+    d['tasa_historica'] = (d['compras_previas'] + SUAVIZADO * prior) / (d['n_visitas_previas'] + SUAVIZADO)
+    d['dias_desde_visita'] = g['dia_visita'].diff().fillna(0)
+    dia_compra = d['dia_visita'].where(d['incidencia_compra'] == 1)
+    ultima = dia_compra.groupby(d['id']).transform(lambda s: s.ffill().shift())
+    d['sin_compras_previas'] = ultima.isna().astype(int)
+    d['dias_desde_compra'] = (d['dia_visita'] - ultima).fillna(DIAS_MAX).clip(upper=DIAS_MAX)
+    unidades_previas = g['cantidad'].cumsum() - d['cantidad']
+    d['unidades_por_compra'] = (unidades_previas / d['compras_previas'].replace(0, np.nan)).fillna(0)
+    # Marca preferida: la más comprada antes de esta visita (0 si aún no compró)
+    conteo = np.column_stack([
+        (d['id_marca'] == m).astype(int).groupby(d['id']).cumsum() - (d['id_marca'] == m).astype(int) for m in MARCAS])
+    pref = conteo.argmax(axis=1) + 1
+    pref[conteo.sum(axis=1) == 0] = 0
+    d['marca_preferida'] = pref
+    fila, col = np.arange(len(d)), np.maximum(pref - 1, 0)
+    d['precio_preferida'] = np.where(pref > 0, d[PRECIOS].to_numpy()[fila, col], d['precio_medio'])
+    d['promo_preferida'] = np.where(pref > 0, d[PROMOS].to_numpy()[fila, col], 0)
+    return d
+
+df = construir_variables(df)
+y = df['incidencia_compra'].to_numpy()
+
+HISTORIA = ['tasa_historica', 'compro_visita_anterior', 'n_visitas_previas', 'dias_desde_visita', 'dias_desde_compra',
+            'sin_compras_previas', 'unidades_por_compra', 'ultima_marca_comprada', 'marca_preferida']
+PRECIO = PRECIOS + PROMOS + ['precio_medio', 'n_promos', 'precio_preferida', 'promo_preferida']
+CLIENTE = DEMO + ['segmento']          # El segmento se construye en el capítulo de segmentación
+CATEGORICAS = ['ultima_marca_comprada', 'marca_preferida', 'ocupacion', 'segmento']
+print(f'Visitas: {len(df):,} | Tasa inicial: {pct(PRIOR)} | Suavizado: {SUAVIZADO} | Tope de días: {DIAS_MAX}')
+print(f'Variables candidatas: {len(HISTORIA)} de historia, {len(PRECIO)} de precio y {len(CLIENTE)} del cliente')
+
+# ==================================================================================================
+# 5. Análisis exploratorio
+# ==================================================================================================
+
+# [Celda 20]
+df['mes'] = (df['dia_visita'] - 1) // 30 + 1
+por_mes = df.groupby('mes').agg(visitas=('incidencia_compra', 'size'), tasa=('incidencia_compra', 'mean'),
+                                precio=('precio_medio', 'mean'))
+fig, (arriba, medio, abajo) = plt.subplots(3, 1, figsize=(9, 6), sharex=True, height_ratios=[2, 1, 1])
+arriba.plot(por_mes.index, por_mes['tasa'] * 100, color=AZUL, marker='o', markersize=4)
+mes_oot = (INICIO_OOT - 1) // 30 + 1
+for eje in (arriba, medio, abajo):
+    eje.axvline(mes_oot - 0.5, color=TINTA, linestyle=':', linewidth=1.2)
+arriba.annotate('Inicio de la prueba fuera de tiempo', (mes_oot - 0.5, 36), xytext=(-6, 0),
+                textcoords='offset points', ha='right', color=TINTA)
+arriba.set(ylabel='Compra (%)', ylim=(0, 40), title='Tasa de compra, precio medio y visitas por mes')
+medio.plot(por_mes.index, por_mes['precio'], color=NARANJA)
+medio.set_ylabel('Precio medio')
+abajo.bar(por_mes.index, por_mes['visitas'], color=GRIS)
+abajo.set(ylabel='Visitas', xlabel='Mes desde la apertura')
+plt.tight_layout(); fig.savefig('img/tasa_compra_mensual.png', dpi=130, bbox_inches='tight'); plt.show()
+
+# [Celda 21]
+dias = df.drop_duplicates('dia_visita')
+compras = df[df['incidencia_compra'] == 1]
+marcas = pd.DataFrame([{
+    'Marca': m,
+    'Precio medio': dias[f'precio_marca_{m}'].mean(),
+    'Mínimo': dias[f'precio_marca_{m}'].min(),
+    'Máximo': dias[f'precio_marca_{m}'].max(),
+    '% días en promoción': pct(dias[f'promo_marca_{m}'].mean()),
+    'Precio en promoción vs sin promoción': pct(dias.groupby(f'promo_marca_{m}')[f'precio_marca_{m}'].mean().pipe(lambda s: s[1] / s[0] - 1)),
+    'Participación en compras': pct((compras['id_marca'] == m).mean()),
+    'Unidades por compra': compras.loc[compras['id_marca'] == m, 'cantidad'].mean(),
+} for m in MARCAS]).set_index('Marca').round(2)
+marcas
+
+# [Celda 22]
+fig, ejes = plt.subplots(2, 2, figsize=(10, 6.4))
+q_precio = pd.qcut(df['precio_medio'], 5, labels=['Q1\nmás barato', 'Q2', 'Q3', 'Q4', 'Q5\nmás caro'])
+t = df.groupby(q_precio, observed=True)['incidencia_compra'].mean() * 100
+ejes[0, 0].bar(t.index.astype(str), t, color=AZUL); ejes[0, 0].set(title='Por quintil de precio medio del día', ylabel='Compra (%)')
+t = df.groupby('n_promos')['incidencia_compra'].mean() * 100
+ejes[0, 1].bar(t.index.astype(str), t, color=AZUL); ejes[0, 1].set(title='Por número de marcas en promoción', xlabel='Marcas en promoción')
+tramos = pd.cut(df['n_visitas_previas'], [-1, 0, 2, 5, 10, 20, 50, 400], labels=['0', '1-2', '3-5', '6-10', '11-20', '21-50', '51+'])
+t = df.groupby(tramos, observed=True)['incidencia_compra'].mean() * 100
+ejes[1, 0].bar(t.index.astype(str), t, color=GRIS); ejes[1, 0].set(title='Por visitas previas del cliente', ylabel='Compra (%)', xlabel='Visitas previas')
+tasa_cliente = df.groupby('id')['incidencia_compra'].mean()
+ejes[1, 1].hist(tasa_cliente * 100, bins=30, color=GRIS); ejes[1, 1].set(title='Tasa de compra de cada cliente', xlabel='Compra (%)', ylabel='Clientes')
+for e in ejes.flat:
+    e.grid(axis='x', visible=False)
+plt.tight_layout(); fig.savefig('img/eda_patrones.png', dpi=130, bbox_inches='tight'); plt.show()
+
+anio1 = df[df['dia_visita'] <= 365].groupby('id')['incidencia_compra'].mean()
+anio2 = df[df['dia_visita'] > 365].groupby('id')['incidencia_compra'].mean()
+orden = df.groupby('id')['incidencia_compra'].sum().sort_values(ascending=False)
+print(f'Correlación de la tasa de cada cliente entre el año 1 y el año 2: {anio1.corr(anio2):.2f}')
+print(f'El 10 % de clientes que más compra concentra {pct(orden.head(len(orden) // 10).sum() / orden.sum())} de las compras')
+print(f'Tasa según la visita anterior: con compra {pct(df.loc[df["compro_visita_anterior"] == 1, "incidencia_compra"].mean())} | '
+      f'sin compra {pct(df.loc[df["compro_visita_anterior"] == 0, "incidencia_compra"].mean())}')
+
+# [Celda 23]
+cliente = df.groupby('id').agg(**{v: (v, 'first') for v in DEMO}, tasa=('incidencia_compra', 'mean'))
+cliente['edad_tramo'] = pd.cut(cliente['edad'], [0, 29, 44, 59, 100], labels=['18-29', '30-44', '45-59', '60+'])
+cliente['ingreso_quintil'] = pd.qcut(cliente['ingreso_anual'], 5, labels=['Q1', 'Q2', 'Q3', 'Q4', 'Q5'])
+visitas_cliente = df.groupby('id').size()
+filas = []
+for v in ['genero', 'estado_civil', 'nivel_educacion', 'ocupacion', 'edad_tramo', 'ingreso_quintil']:
+    for grupo, sub in cliente.groupby(v, observed=True):
+        w = visitas_cliente.loc[sub.index]
+        filas.append({'Variable': v, 'Grupo': grupo, 'Clientes': len(sub), 'Tasa de compra': pct((sub['tasa'] * w).sum() / w.sum())})
+pd.DataFrame(filas).set_index(['Variable', 'Grupo']).T
+
+# ==================================================================================================
+# 6. Segmentación de clientes
+# ==================================================================================================
+
+# [Celda 24]
+# Se evalúan de 2 a 8 segmentos. El máximo es 8 porque, con 500 clientes, más segmentos
+# dejan grupos de menos de 30 clientes (6 %), demasiado pequeños para diseñar una acción comercial.
+# La tabla siguiente lo confirma en la columna "Segmento más pequeño".
+K_CANDIDATOS = range(2, 9)
+
+# [Celda 25]
+clientes = df.groupby('id')[DEMO].first()
+Z = StandardScaler().fit_transform(clientes)
+rng = np.random.default_rng(SEMILLA)
+filas = []
+for k in K_CANDIDATOS:
+    km = KMeans(k, n_init=20, random_state=SEMILLA).fit(Z)
+    aris = []
+    for b in range(10):
+        idx = rng.integers(0, len(Z), len(Z))
+        aris.append(adjusted_rand_score(km.labels_, KMeans(k, n_init=10, random_state=b).fit(Z[idx]).predict(Z)))
+    filas.append({'k': k, 'Inercia': round(km.inertia_), 'Silueta': silhouette_score(Z, km.labels_),
+                  'Estabilidad (ARI)': np.mean(aris), 'Segmento más pequeño': int(np.bincount(km.labels_).min())})
+tabla_k = pd.DataFrame(filas).set_index('k')
+K = int(tabla_k['Estabilidad (ARI)'].idxmax())
+print(f'k elegido por estabilidad: {K}')
+tabla_k.round(3)
+
+# [Celda 26]
+km = KMeans(K, n_init=20, random_state=SEMILLA).fit(Z)
+# Se numeran los segmentos de menor a mayor ingreso para que el orden no dependa del azar
+orden_ingreso = clientes.groupby(km.labels_)['ingreso_anual'].mean().sort_values().index
+clientes['segmento'] = pd.Series(km.labels_, index=clientes.index).map({s: i for i, s in enumerate(orden_ingreso)})
+df['segmento'] = df['id'].map(clientes['segmento'])
+
+perfil = clientes.groupby('segmento').agg(
+    Clientes=('edad', 'size'), Edad=('edad', 'mean'), Ingreso=('ingreso_anual', 'mean'), **{'% género 1': ('genero', 'mean')},
+    **{'% estado civil 1': ('estado_civil', 'mean')}, Educación=('nivel_educacion', 'mean'), Ocupación=('ocupacion', 'mean'))
+perfil['Tasa de compra'] = df.groupby('segmento')['incidencia_compra'].mean()
+perfil['Unidades por compra'] = df[df['incidencia_compra'] == 1].groupby('segmento')['cantidad'].mean()
+NOMBRES = {0: 'Jóvenes de menor ingreso', 1: 'Adultos de ingreso medio', 2: 'Mayores de mayor ingreso'}
+perfil.index = [NOMBRES.get(s, f'S{s}') for s in perfil.index]
+perfil.assign(**{c: perfil[c].map(pct) for c in ['% género 1', '% estado civil 1', 'Tasa de compra']}).round(2)
+
+# ==================================================================================================
+# 7. Selección de variables
+# ==================================================================================================
+
+# [Celda 27]
+# Selección de variables
+DIAS_ARRANQUE, N_GRUPOS = 91, 10
+MAX_CONCENTRACION = 0.95
+PSI_REVISAR, PSI_EXCLUIR = 0.10, 0.25
+MIN_IV, MIN_GINI, MAX_CV_GINI = 0.02, 0.03, 0.80
+MAX_CORRELACION = 0.85
+
+# --- 7.1 Inventario de candidatas ---
+
+# [Celda 28]
+SUBE, BAJA, SIN_HIPOTESIS = 'sube la compra', 'baja la compra', 'sin hipótesis'
+SENTIDO = {'tasa_historica': SUBE, 'compro_visita_anterior': SUBE, 'n_visitas_previas': SUBE, 'dias_desde_compra': BAJA,
+           'sin_compras_previas': BAJA, 'unidades_por_compra': SUBE, 'precio_medio': BAJA, 'n_promos': SUBE,
+           'precio_preferida': BAJA, 'promo_preferida': SUBE}
+SENTIDO |= {v: BAJA for v in PRECIOS} | {v: SUBE for v in PROMOS}
+CANDIDATAS = HISTORIA + PRECIO + CLIENTE
+EXCLUSION_EXPERTA = {'id_marca': 'Resultado de la visita: fuga de información',
+                     'cantidad': 'Resultado de la visita: fuga de información',
+                     'tamanio_ciudad': 'El diccionario indica no considerarla', 'id': 'Identificador del cliente'}
+grupo_de = {**{v: 'historia' for v in HISTORIA}, **{v: 'precio' for v in PRECIO}, **{v: 'cliente' for v in CLIENTE}}
+inventario = pd.DataFrame({'grupo': [grupo_de[c] for c in CANDIDATAS],
+                           'sentido esperado': [SENTIDO.get(c, SIN_HIPOTESIS) for c in CANDIDATAS]}, index=CANDIDATAS)
+en_dev = mascara_train(INICIO_OOT)
+X_dev = df.loc[en_dev, CANDIDATAS].astype(float)
+print(f'{len(CANDIDATAS)} candidatas | {len(EXCLUSION_EXPERTA)} columnas retiradas por criterio experto | '
+      f'{int(y[en_dev].sum()):,} compras en desarrollo')
+display(pd.Series(EXCLUSION_EXPERTA, name='Motivo').to_frame())
+inventario.T
+
+# --- 7.2 Filtro univariado ---
+
+# [Celda 29]
+univariado = pd.DataFrame({'concentración': X_dev.apply(lambda x: x.value_counts(normalize=True).iloc[0]),
+                           'desv. estándar': X_dev.std()})
+univariado['falla'] = np.select([univariado['desv. estándar'] == 0, univariado['concentración'] > MAX_CONCENTRACION],
+                                ['sin variación', 'concentración'], '')
+pasan_univariado = univariado.index[univariado['falla'] == ''].tolist()
+print(f'Pasan el filtro univariado: {len(pasan_univariado)} de {len(CANDIDATAS)}')
+univariado.sort_values('concentración', ascending=False).head(8).round(3)
+
+# --- 7.3 Estabilidad en el tiempo (PSI) ---
+
+# [Celda 30]
+def cortes_fijos(x, n=N_GRUPOS):
+    """Un grupo por valor si hay pocos valores distintos; deciles en otro caso."""
+    valores = np.unique(x)
+    return valores[1:] if len(valores) <= 12 else np.unique(np.quantile(x, np.linspace(0, 1, n + 1)[1:-1]))
+
+def asignar_grupo(x, cortes):
+    return np.searchsorted(cortes, x, side='right')
+
+def psi(referencia, evaluacion, eps=1e-4):
+    cortes = cortes_fijos(referencia)
+    k = len(cortes) + 1
+    p = np.clip(np.bincount(asignar_grupo(referencia, cortes), minlength=k) / len(referencia), eps, None)
+    q = np.clip(np.bincount(asignar_grupo(evaluacion, cortes), minlength=k) / len(evaluacion), eps, None)
+    return float(np.sum((p - q) * np.log(p / q)))
+
+en_ref = ((df['dia_visita'] > DIAS_ARRANQUE) & (df['dia_visita'] < BLOQUES_MODELAMIENTO[0][0])).to_numpy()
+estabilidad = pd.DataFrame({f'Días {d} a {h}': {c: psi(df.loc[en_ref, c].to_numpy(float), df.loc[mascara(d, h), c].to_numpy(float))
+                                              for c in pasan_univariado} for d, h in BLOQUES_MODELAMIENTO})
+estabilidad['PSI máximo'] = estabilidad.max(axis=1)
+estabilidad['lectura'] = np.select([estabilidad['PSI máximo'] > PSI_EXCLUIR, estabilidad['PSI máximo'] > PSI_REVISAR],
+                                   ['excluir', 'revisar'], 'estable')
+pasan_estabilidad = estabilidad.index[estabilidad['lectura'] != 'excluir'].tolist()
+print(f'Pasan la prueba de estabilidad: {len(pasan_estabilidad)} de {len(pasan_univariado)}')
+estabilidad.sort_values('PSI máximo', ascending=False).round(3)
+
+# --- 7.4 Relación con la compra (IV, Gini y sentido) ---
+
+# [Celda 31]
+def woe_iv(grupo, y_r, k, suavizado=0.5):
+    compras_g = np.bincount(grupo, weights=y_r, minlength=k)
+    sin_compra_g = np.bincount(grupo, minlength=k) - compras_g
+    p_si = (compras_g + suavizado) / (compras_g.sum() + suavizado * k)
+    p_no = (sin_compra_g + suavizado) / (sin_compra_g.sum() + suavizado * k)
+    woe = np.log(p_si / p_no)
+    return woe, float(np.sum((p_si - p_no) * woe))
+
+def bivariado(c):
+    x = df[c].to_numpy(float)
+    ginis, ivs = [], []
+    for d, h in BLOQUES_MODELAMIENTO:
+        tr, te = mascara_train(d), mascara(d, h)
+        cortes = cortes_fijos(x[tr])
+        k = len(cortes) + 1
+        woe, _ = woe_iv(asignar_grupo(x[tr], cortes), y[tr], k)
+        g_te = asignar_grupo(x[te], cortes)
+        ginis.append(gini(y[te], woe[g_te]))
+        ivs.append(woe_iv(g_te, y[te], k)[1])
+    ginis = np.array(ginis)
+    return pd.Series({'IV mínimo': min(ivs), 'Gini medio': ginis.mean(), 'Gini mínimo': ginis.min(),
+                      'CV del Gini': ginis.std() / abs(ginis.mean()) if ginis.mean() != 0 else np.inf})
+
+relacion = pd.DataFrame({c: bivariado(c) for c in pasan_estabilidad}).T
+compra_dev = pd.Series(y[en_dev], index=X_dev.index)
+relacion['sentido observado'] = [SUBE if X_dev[c].corr(compra_dev, method='spearman') > 0 else BAJA for c in pasan_estabilidad]
+relacion['sentido esperado'] = inventario['sentido esperado']
+relacion['falla'] = [', '.join(regla for regla, falla in [
+        ('IV', r['IV mínimo'] <= MIN_IV), ('Gini', r['Gini mínimo'] <= MIN_GINI), ('CV del Gini', r['CV del Gini'] >= MAX_CV_GINI),
+        ('sentido', r['sentido esperado'] != SIN_HIPOTESIS and r['sentido esperado'] != r['sentido observado'])] if falla)
+    for _, r in relacion.iterrows()]
+pasan_bivariado = relacion.index[relacion['falla'] == ''].tolist()
+print(f'Pasan la prueba de relación con la compra: {len(pasan_bivariado)} de {len(pasan_estabilidad)}')
+relacion.sort_values('Gini medio', ascending=False).round(3)
+
+# --- 7.5 Correlación ---
+
+# [Celda 32]
+correlacion = X_dev[pasan_bivariado].corr(method='spearman').abs()
+orden = relacion.loc[pasan_bivariado].sort_values(['Gini medio', 'CV del Gini'], ascending=[False, True], kind='stable').index
+SELECCIONADAS, redundantes = [], {}
+for c in orden:
+    choque = [e for e in SELECCIONADAS if correlacion.loc[c, e] > MAX_CORRELACION]
+    if choque:
+        redundantes[c] = {'Gini': relacion.loc[c, 'Gini medio'], 'redundante con': choque[0],
+                          'Gini de la elegida': relacion.loc[choque[0], 'Gini medio'], 'correlación': correlacion.loc[c, choque[0]]}
+    else:
+        SELECCIONADAS.append(c)
+assert all(r['Gini de la elegida'] >= r['Gini'] for r in redundantes.values()), 'Se excluyó una variable con más Gini'
+
+final = correlacion.loc[SELECCIONADAS, SELECCIONADAS].mask(np.eye(len(SELECCIONADAS), dtype=bool), 0)
+vif = pd.Series(np.diag(np.linalg.inv(X_dev[SELECCIONADAS].corr().to_numpy())), index=SELECCIONADAS)
+print(f'{len(pasan_bivariado)} variables llegan a esta etapa y quedan {len(SELECCIONADAS)} | '
+      f'correlación máxima entre las elegidas: {final.max().max():.3f} | VIF máximo: {vif.max():.2f}')
+display(pd.DataFrame(redundantes).T.infer_objects().round(3))
+vif.sort_values(ascending=False).round(2).to_frame('VIF').T
+
+# --- 7.6 Decisión por variable ---
+
+# [Celda 33]
+def decision(c):
+    if univariado.loc[c, 'falla']:
+        return 'excluida', f"univariado: {univariado.loc[c, 'falla']}"
+    if estabilidad.loc[c, 'lectura'] == 'excluir':
+        return 'excluida', 'estabilidad: PSI > 0.25'
+    if relacion.loc[c, 'falla']:
+        return 'excluida', f"relación con la compra: {relacion.loc[c, 'falla']}"
+    if c in redundantes:
+        return 'excluida', f"correlación con {redundantes[c]['redundante con']}"
+    if estabilidad.loc[c, 'lectura'] == 'revisar':
+        return 'avanza', 'PSI entre 0.10 y 0.25: vigilar'
+    return 'avanza', ''
+
+decisiones = pd.concat([inventario['grupo'], univariado['concentración'], estabilidad['PSI máximo'],
+                        relacion[['IV mínimo', 'Gini medio']]], axis=1).reindex(CANDIDATAS)
+decisiones[['decisión', 'motivo']] = [decision(c) for c in CANDIDATAS]
+display(decisiones.groupby(['decisión', 'grupo'])['motivo'].value_counts().to_frame('variables'))
+print('Variables seleccionadas:', ', '.join(SELECCIONADAS))
+decisiones.sort_values(['decisión', 'Gini medio'], ascending=[True, False]).round(3)
+
+# ==================================================================================================
+# 8. Comparación de campeón, retadores y ajuste fino
+# ==================================================================================================
+
+# [Celda 34]
+# Segmentación, ajuste fino y reproducibilidad
+K_CANDIDATOS = range(2, 9)
+N_ITER_TUNING = 20
+SEMILLA, N_BOOTSTRAP, N_BOOT_DIAS = 42, 1000, 200
+
+# --- 8.1. Qué modelos compiten ---
+
+# [Celda 35]
+# Espacios de búsqueda equivalentes: tamaño del árbol, número de árboles, aprendizaje y regularización
+ESPACIO = dict(n_estimators=[200, 400, 800], learning_rate=[0.01, 0.03, 0.05], num_leaves=[7, 15, 31, 63],
+               min_child_samples=[50, 100, 200, 400], colsample_bytree=[0.6, 0.8, 1.0], reg_lambda=[0, 1, 5, 20])
+ESPACIO_XGB = dict(n_estimators=[200, 400, 800], learning_rate=[0.01, 0.03, 0.05], max_depth=[2, 3, 4, 6],
+                   min_child_weight=[1, 5, 20, 50], colsample_bytree=[0.6, 0.8, 1.0], reg_lambda=[0, 1, 5, 20])
+MEJORES_PARAMS, MEJORES_PARAMS_XGB = {}, {}
+
+@dataclass
+class Ajuste:
+    variables: list
+    modelo: object
+    predecir: callable
+
+def crear(algoritmo, variables, params=None):
+    if algoritmo == 'logistica':
+        num = [v for v in variables if v not in CATEGORICAS]
+        cat = [v for v in variables if v in CATEGORICAS]
+        prep = ColumnTransformer([('num', StandardScaler(), num),
+                                  ('cat', OneHotEncoder(handle_unknown='ignore', sparse_output=False), cat)])
+        return make_pipeline(prep, LogisticRegression(max_iter=5000))
+    if algoritmo == 'lightgbm':
+        return LGBMClassifier(random_state=SEMILLA, n_jobs=4, verbose=-1)
+    if algoritmo == 'lightgbm_ajustado':
+        params = params if params is not None else MEJORES_PARAMS
+        return LGBMClassifier(subsample=0.8, subsample_freq=1, random_state=SEMILLA, n_jobs=4, verbose=-1, **params)
+    if algoritmo == 'xgboost':
+        return XGBClassifier(eval_metric='logloss', random_state=SEMILLA, n_jobs=4)
+    params = params if params is not None else MEJORES_PARAMS_XGB
+    return XGBClassifier(subsample=0.8, eval_metric='logloss', random_state=SEMILLA, n_jobs=4, **params)
+
+def ajustar(algoritmo, variables, en_train, params=None):
+    if algoritmo == 'regla':
+        return Ajuste(['tasa_historica'], None, lambda d: d['tasa_historica'].to_numpy())
+    variables = list(variables)
+    m = crear(algoritmo, variables, params).fit(df.loc[en_train, variables], y[en_train])
+    return Ajuste(variables, m, lambda d: m.predict_proba(d[variables])[:, 1])
+
+def ginis_desarrollo(algoritmo, variables, params=None):
+    return [gini(y[mascara(d, h)], ajustar(algoritmo, variables, mascara_train(d), params).predecir(df.loc[mascara(d, h)]))
+            for d, h in BLOQUES_MODELAMIENTO]
+
+# [Celda 36]
+def busqueda_aleatoria(algoritmo, espacio):
+    """Prueba N_ITER_TUNING combinaciones al azar y devuelve la de mayor Gini medio en desarrollo."""
+    rng = np.random.default_rng(SEMILLA)
+    candidatos = [{k: v[int(rng.integers(len(v)))] for k, v in espacio.items()} for _ in range(N_ITER_TUNING)]
+    filas = []
+    for p in candidatos:
+        gs = ginis_desarrollo(algoritmo, SELECCIONADAS, p)
+        filas.append({**p, 'Gini medio': np.mean(gs), 'Desviación': np.std(gs, ddof=1)})
+    tabla = pd.DataFrame(filas).sort_values('Gini medio', ascending=False)
+    return candidatos[tabla.index[0]], tabla
+
+MEJORES_PARAMS, busqueda = busqueda_aleatoria('lightgbm_ajustado', ESPACIO)
+MEJORES_PARAMS_XGB, busqueda_xgb = busqueda_aleatoria('xgboost_ajustado', ESPACIO_XGB)
+for nombre, defecto, mejores, tabla in [('LightGBM', 'lightgbm', MEJORES_PARAMS, busqueda),
+                                         ('XGBoost', 'xgboost', MEJORES_PARAMS_XGB, busqueda_xgb)]:
+    print(f'{nombre}: Gini medio con valores por defecto {np.mean(ginis_desarrollo(defecto, SELECCIONADAS)):.3f} | '
+          f'ajustado {tabla["Gini medio"].iloc[0]:.3f} | mejores hiperparámetros {mejores}')
+display(busqueda.head(5).round(3))
+busqueda_xgb.head(5).round(3)
+
+# [Celda 37]
+# Parametros
+CUPO = 0.20
+DESCUENTO, MARGEN_BRUTO = 0.05, 0.30
+TOLERANCIA_GINI = 0.01
+
+# [Celda 38]
+CONJUNTOS = {'historia': [v for v in SELECCIONADAS if v in HISTORIA], 'seleccionado': SELECCIONADAS, 'completo': CANDIDATAS}
+COMPLEJIDAD = dict(regla=0, logistica=1, lightgbm=2, xgboost=2, lightgbm_ajustado=3, xgboost_ajustado=3)
+REGLA = ('regla', 'tasa histórica')
+CAMPEON = ('logistica', 'completo')
+CONFIGS = [REGLA] + [(a, s) for a in ['logistica', 'lightgbm', 'lightgbm_ajustado', 'xgboost', 'xgboost_ajustado']
+                     for s in CONJUNTOS]
+etiqueta = lambda cfg: ' | '.join(cfg)
+
+def ajustar_config(cfg, inicio):
+    algoritmo, conjunto = cfg
+    return ajustar(algoritmo, CONJUNTOS.get(conjunto, []), mascara_train(inicio))
+
+filas = []
+for d, h in BLOQUES_MODELAMIENTO:
+    te = mascara(d, h)
+    for cfg in CONFIGS:
+        a = ajustar_config(cfg, d)
+        s = a.predecir(df.loc[te])
+        filas.append({'config': etiqueta(cfg), 'algoritmo': cfg[0], 'bloque': d, 'gini': gini(y[te], s),
+                      'tasa_cupo': tasa_cupo(y[te], s, CUPO), 'n_variables': len(a.variables)})
+res = pd.DataFrame(filas)
+
+pivote = res.pivot(index='config', columns='bloque', values='gini')
+resumen = pivote.assign(media=pivote.mean(axis=1), desv=pivote.std(axis=1))
+resumen['robusto'] = resumen['media'] - resumen['desv']
+resumen['tasa_cupo'] = res.groupby('config')['tasa_cupo'].mean()
+resumen['n_variables'] = res.groupby('config')['n_variables'].first()
+resumen['complejidad'] = res.groupby('config')['algoritmo'].first().map(COMPLEJIDAD)
+resumen = resumen.sort_values('robusto', ascending=False)
+
+# Solo compiten las configuraciones que respetan la selección de variables; 'completo' queda como referencia
+aptas = resumen[[not c.endswith('| completo') for c in resumen.index]]
+mejor = aptas['robusto'].max()
+elegibles = aptas[aptas['robusto'] >= mejor - TOLERANCIA_GINI].sort_values(['complejidad', 'n_variables', 'robusto'],
+                                                                           ascending=[True, True, False])
+GANADOR_ET = elegibles.index[0]
+GANADOR = next(c for c in CONFIGS if etiqueta(c) == GANADOR_ET)
+print(f'Mejor puntaje robusto: {mejor:.3f} | Umbral: {mejor - TOLERANCIA_GINI:.3f} | Configuraciones elegibles: {len(elegibles)}')
+print(f'Modelo elegido: {GANADOR_ET}')
+display(resumen.round(3))
+
+tolerancias = pd.DataFrame([{'Tolerancia': t, 'Modelo elegido': aptas[aptas['robusto'] >= mejor - t]
+                             .sort_values(['complejidad', 'n_variables', 'robusto'], ascending=[True, True, False]).index[0]}
+                            for t in [0, 0.005, 0.01, 0.02, 0.03]]).set_index('Tolerancia')
+tolerancias
+
+# ==================================================================================================
+# 9. Evaluación fuera de tiempo
+# ==================================================================================================
+
+# [Celda 39]
+en_oot = mascara(INICIO_OOT, DIA_FINAL)
+oot = df.loc[en_oot]
+y_oot = y[en_oot]
+ajustes = {cfg: ajustar_config(cfg, INICIO_OOT) for cfg in CONFIGS}
+scores = {cfg: ajustes[cfg].predecir(oot) for cfg in CONFIGS}
+
+tabla_oot = pd.DataFrame([{
+    'config': etiqueta(cfg), 'Gini OOT': gini(y_oot, scores[cfg]), 'AP': average_precision_score(y_oot, scores[cfg]),
+    'Tasa en cupo': tasa_cupo(y_oot, scores[cfg], CUPO),
+    'Brier': brier_score_loss(y_oot, scores[cfg]) if cfg != REGLA else np.nan,
+    'Variables': len(ajustes[cfg].variables), 'Gini desarrollo': resumen.loc[etiqueta(cfg), 'media'],
+} for cfg in CONFIGS]).set_index('config').sort_values('Gini OOT', ascending=False)
+
+print(f'OOT: {len(y_oot):,} visitas de {oot["id"].nunique()} clientes | tasa {pct(y_oot.mean())} | cupo de {int(len(y_oot) * CUPO):,} visitas')
+print(f'Modelo elegido antes de mirar OOT: {GANADOR_ET}')
+print(f'Posición del elegido entre {len(CONFIGS)} configuraciones: {tabla_oot.index.get_loc(GANADOR_ET) + 1}')
+tabla_oot.round(3)
+
+# [Celda 40]
+CUPOS = [0.05, 0.10, 0.20, 0.30, 0.50]
+ids_oot = oot['id'].to_numpy()
+grupos_cliente = [np.flatnonzero(ids_oot == c) for c in np.unique(ids_oot)]
+
+def bootstrap(y_r, dic, cupos, n=N_BOOTSTRAP, semilla=SEMILLA):
+    """Remuestreo pareado de clientes completos: todos los modelos se evalúan sobre las mismas muestras."""
+    rng = np.random.default_rng(semilla)
+    g = {k: np.empty(n) for k in dic}
+    t = {k: np.empty((n, len(cupos))) for k in dic}
+    for b in range(n):
+        idx = np.concatenate([grupos_cliente[i] for i in rng.integers(0, len(grupos_cliente), len(grupos_cliente))])
+        yb, total = y_r[idx], len(idx)
+        ks = [max(1, int(total * c)) for c in cupos]
+        for k, s in dic.items():
+            g[k][b] = gini(yb, s[idx])
+            acum = np.cumsum(yb[np.lexsort((rng.random(total), -s[idx]))])
+            t[k][b] = [acum[q - 1] / q for q in ks]
+    return g, t
+
+REFERENCIAS = list(dict.fromkeys([GANADOR, ('lightgbm_ajustado', 'historia'), ('xgboost_ajustado', 'historia'),
+                                   CAMPEON, ('lightgbm_ajustado', 'completo'), REGLA]))
+g_boot, t_boot = bootstrap(y_oot, {c: scores[c] for c in REFERENCIAS}, CUPOS)
+ic = lambda v, f=1: f'{f * np.percentile(v, 2.5):+.3f} a {f * np.percentile(v, 97.5):+.3f}'
+i_cupo = CUPOS.index(CUPO)
+
+filas = [{'Modelo': etiqueta(c), 'Gini OOT': round(gini(y_oot, scores[c]), 3), 'IC 95 % Gini': ic(g_boot[c]),
+          'Tasa en cupo': pct(tasa_cupo(y_oot, scores[c], CUPO)),
+          'IC 95 % tasa': f'{pct(np.percentile(t_boot[c][:, i_cupo], 2.5))} a {pct(np.percentile(t_boot[c][:, i_cupo], 97.5))}'}
+         for c in REFERENCIAS]
+filas.append({'Modelo': 'Azar', 'Gini OOT': 0, 'IC 95 % Gini': '', 'Tasa en cupo': pct(y_oot.mean()), 'IC 95 % tasa': ''})
+display(pd.DataFrame(filas).set_index('Modelo'))
+
+difs = pd.DataFrame([{'Comparación': f'{etiqueta(GANADOR)} − {etiqueta(c)}',
+                      'Diferencia de Gini': round(gini(y_oot, scores[GANADOR]) - gini(y_oot, scores[c]), 3),
+                      'IC 95 %': ic(g_boot[GANADOR] - g_boot[c])} for c in REFERENCIAS if c != GANADOR]).set_index('Comparación')
+display(difs)
+
+fig, eje = plt.subplots(figsize=(6.4, 4.6))
+x = np.arange(1, len(y_oot) + 1) / len(y_oot)
+CURVAS = list(dict.fromkeys([GANADOR, ('lightgbm_ajustado', 'historia'), CAMPEON, REGLA]))
+for c, color in zip(CURVAS, [AZUL, VERDE, NARANJA, GRIS]):
+    orden = np.lexsort((np.random.default_rng(SEMILLA).random(len(y_oot)), -scores[c]))
+    eje.plot(x * 100, np.cumsum(y_oot[orden]) / y_oot.sum() * 100, color=color, label=etiqueta(c),
+             linewidth=2.4 if c == GANADOR else 1.6)
+eje.plot([0, 100], [0, 100], color=TINTA, linestyle='--', linewidth=1, label='Azar')
+eje.axvline(CUPO * 100, color=TINTA, linestyle=':', linewidth=1.2)
+eje.set(xlabel='Visitas contactadas, de mayor a menor score (%)', ylabel='Compras alcanzadas (%)',
+        title='Curva de ganancia en la prueba fuera de tiempo', xlim=(0, 100), ylim=(0, 100))
+eje.legend(loc='lower right', fontsize=8)
+plt.tight_layout(); fig.savefig('img/curva_ganancia_oot.png', dpi=130, bbox_inches='tight'); plt.show()
+
+# ==================================================================================================
+# 10. Calibración y proyección de demanda
+# ==================================================================================================
+
+# [Celda 41]
+p_oot = scores[GANADOR]
+tasa_train = y[mascara_train(INICIO_OOT)].mean()
+cal = pd.DataFrame({'Enfoque': ['Modelo elegido', 'Tasa de entrenamiento para todos'],
+                    'Promedio predicho': [pct(p_oot.mean()), pct(tasa_train)], 'Tasa real': [pct(y_oot.mean())] * 2,
+                    'Brier': [round(brier_score_loss(y_oot, p_oot), 4), round(brier_score_loss(y_oot, np.full(len(y_oot), tasa_train)), 4)]})
+display(cal.set_index('Enfoque'))
+
+decil = pd.qcut(p_oot, 10, labels=False, duplicates='drop')
+por_decil = pd.DataFrame({'p': p_oot, 'y': y_oot, 'd': decil}).groupby('d').mean()
+semana = (oot['dia_visita'].to_numpy() - INICIO_OOT) // 7
+demanda = pd.DataFrame({'semana': semana, 'p': p_oot, 'y': y_oot}).groupby('semana').agg(predicho=('p', 'sum'), real=('y', 'sum'), visitas=('y', 'size'))
+demanda = demanda[demanda['visitas'] >= 200]
+error_semanal = (demanda['predicho'] - demanda['real']).abs() / demanda['real']
+print('Predicho frente a observado por decil (%):', ', '.join(f'{100 * a:.0f}/{100 * b:.0f}' for a, b in zip(por_decil['p'], por_decil['y'])))
+print(f'Error absoluto medio de la demanda semanal: {pct(error_semanal.mean())} | sesgo total: {pct(demanda["predicho"].sum() / demanda["real"].sum() - 1)}')
+
+fig, (e1, e2) = plt.subplots(1, 2, figsize=(10, 3.8), width_ratios=[1, 1.6])
+e1.plot([0, 70], [0, 70], color=TINTA, linestyle='--', linewidth=1)
+e1.plot(por_decil['p'] * 100, por_decil['y'] * 100, color=AZUL, marker='o')
+e1.set(xlabel='Probabilidad predicha (%)', ylabel='Compra observada (%)', title='Calibración por decil')
+e2.plot(demanda.index, demanda['real'], color=GRIS, marker='o', markersize=3, label='Compras registradas')
+e2.plot(demanda.index, demanda['predicho'], color=AZUL, label='Suma de probabilidades')
+e2.set(xlabel='Semana de la prueba fuera de tiempo', ylabel='Compras', title='Demanda semanal')
+e2.legend(fontsize=8)
+plt.tight_layout(); fig.savefig('img/calibracion_demanda.png', dpi=130, bbox_inches='tight'); plt.show()
+
+# ==================================================================================================
+# 11. Análisis de sensibilidad
+# ==================================================================================================
+
+# [Celda 42]
+alg_g = GANADOR[0] if GANADOR[0] != 'regla' else 'logistica'
+vars_g = ajustes[GANADOR].variables if GANADOR[0] != 'regla' else HISTORIA
+base_gini = gini(y_oot, scores[GANADOR])
+
+# 1. Validación cruzada aleatoria de 5 particiones
+ginis_cv = []
+for tr_, te_ in StratifiedKFold(5, shuffle=True, random_state=SEMILLA).split(df, y):
+    m_tr = np.zeros(len(df), dtype=bool); m_tr[tr_] = True
+    ginis_cv.append(gini(y[te_], ajustar(alg_g, vars_g, m_tr).predecir(df.iloc[te_])))
+print('1. Validación cruzada aleatoria (5 particiones)')
+print(f'   Gini medio {np.mean(ginis_cv):.3f} | desviación {np.std(ginis_cv):.3f} | Gini OOT temporal {base_gini:.3f}')
+
+# 2. Clientes nuevos: el 20 % de los clientes no participa en el entrenamiento
+rng = np.random.default_rng(SEMILLA)
+nuevos = rng.choice(df['id'].unique(), size=df['id'].nunique() // 5, replace=False)
+es_nuevo = df['id'].isin(nuevos).to_numpy()
+aj_sin = ajustar(alg_g, vars_g, mascara_train(INICIO_OOT) & ~es_nuevo)
+en_n = es_nuevo[en_oot]
+print('2. Clientes no vistos en el entrenamiento')
+print(f'   Gini en esos {len(nuevos)} clientes: entrenando sin ellos {gini(y_oot[en_n], aj_sin.predecir(oot[en_n])):.3f} '
+      f'| entrenando con ellos {gini(y_oot[en_n], scores[GANADOR][en_n]):.3f}')
+
+# 3. Retirar los grupos que el modelo usa o agregar los que no usa
+print('3. Retirar o agregar grupos de variables (Gini OOT)')
+for nombre, grupo in [('historia', HISTORIA), ('precio', PRECIO), ('cliente', CLIENTE)]:
+    presentes = [v for v in vars_g if v in grupo]
+    if presentes and len(presentes) < len(vars_g):
+        prueba, texto = [v for v in vars_g if v not in grupo], f'Sin {nombre}'
+    elif not presentes:
+        prueba, texto = vars_g + grupo, f'Con todas las candidatas de {nombre}'
+    else:
+        continue
+    g_r = gini(y_oot, ajustar(alg_g, prueba, mascara_train(INICIO_OOT)).predecir(oot))
+    print(f'   {texto:38s} {g_r:.3f} ({g_r - base_gini:+.3f})')
+
+# 4. Semillas
+if alg_g.startswith(('lightgbm', 'xgboost')):
+    semillas = []
+    for s in range(5):
+        m = crear(alg_g, vars_g).set_params(random_state=s).fit(df.loc[mascara_train(INICIO_OOT), vars_g], y[mascara_train(INICIO_OOT)])
+        semillas.append(gini(y_oot, m.predict_proba(oot[vars_g])[:, 1]))
+    print(f'4. Cinco semillas: Gini OOT entre {min(semillas):.3f} y {max(semillas):.3f}')
+else:
+    print('4. Cinco semillas: no aplica, la logística no depende del azar')
+
+# ==================================================================================================
+# 12. Interpretabilidad y equidad
+# ==================================================================================================
+
+# [Celda 43]
+aj_arbol = ajustes[('lightgbm_ajustado', 'completo')]
+contrib = aj_arbol.modelo.predict(oot[aj_arbol.variables], pred_contrib=True)[:, :-1]
+shap_medio = pd.Series(np.abs(contrib).mean(axis=0), index=aj_arbol.variables).sort_values()
+color_grupo = {'historia': AZUL, 'precio': NARANJA, 'cliente': GRIS}
+top = shap_medio.tail(15)
+fig, eje = plt.subplots(figsize=(7, 4.6))
+eje.barh(top.index, top, color=[color_grupo[grupo_de[v]] for v in top.index])
+eje.set(xlabel='SHAP medio absoluto (escala logit)', title='Variables más usadas por LightGBM ajustado con las 30 candidatas')
+eje.grid(axis='y', visible=False)
+eje.legend(handles=[Patch(color=col, label=nombre) for nombre, col in color_grupo.items()], loc='lower right', fontsize=8)
+plt.tight_layout(); fig.savefig('img/shap_modelo_completo.png', dpi=130, bbox_inches='tight'); plt.show()
+por_grupo = shap_medio.groupby(shap_medio.index.map(grupo_de)).sum()
+print('Participación de cada grupo en el SHAP total:', {k: pct(v / por_grupo.sum()) for k, v in por_grupo.items()})
+print('Cinco variables con mayor SHAP medio:', ', '.join(f'{v} ({x:.3f})' for v, x in shap_medio.tail(5)[::-1].items()))
+
+pipe = ajustes[('logistica', 'seleccionado')].modelo
+nombres = [n.split('__', 1)[1] for n in pipe.steps[0][1].get_feature_names_out()]
+pesos = pd.Series(pipe.steps[-1][1].coef_[0], index=nombres)
+odds = pd.DataFrame({'Coeficiente': pesos, 'Odds ratio': np.exp(pesos)})
+odds.reindex(pesos.abs().sort_values(ascending=False).index).head(12).round(3)
+
+# [Celda 44]
+p_sel = scores[GANADOR]
+umbral = np.sort(p_sel)[::-1][int(len(p_sel) * CUPO) - 1]
+eval_eq = oot.assign(p=p_sel, y=y_oot, sel=p_sel >= umbral,
+                     edad_tramo=pd.cut(oot['edad'], [0, 29, 44, 59, 100], labels=['18-29', '30-44', '45-59', '60+']),
+                     segmento_n=oot['segmento'].map(NOMBRES))
+filas = []
+for v in ['genero', 'edad_tramo', 'segmento_n']:
+    for grupo, sub in eval_eq.groupby(v, observed=True):
+        filas.append({'Variable': v, 'Grupo': grupo, 'Visitas': len(sub), 'Tasa real': pct(sub['y'].mean()),
+                      'Predicho': pct(sub['p'].mean()), 'Gini': round(gini(sub['y'], sub['p']), 3),
+                      'Seleccionadas en el cupo': pct(sub['sel'].mean())})
+pd.DataFrame(filas).set_index(['Variable', 'Grupo'])
+
+# ==================================================================================================
+# 13. Precio: elasticidad de compra y elección de marca
+# ==================================================================================================
+
+# [Celda 45]
+CONTROLES = ['tasa_historica', 'compro_visita_anterior', 'dias_desde_visita']
+df['trimestre'] = (df['dia_visita'] - 1) // 91
+TRIM = [f'trim_{t}' for t in sorted(df['trimestre'].unique())[1:]]
+MESES = [f'mes_{m}' for m in sorted(df['mes'].unique())[1:]]
+for t in sorted(df['trimestre'].unique())[1:]:
+    df[f'trim_{t}'] = (df['trimestre'] == t).astype(float)
+for m in sorted(df['mes'].unique())[1:]:
+    df[f'mes_{m}'] = (df['mes'] == m).astype(float)
+
+class ModeloPrecio:
+    """Logística de respuesta al precio. El precio queda en su escala original; el resto se estandariza."""
+    def __init__(self, precio='precio_medio', otras=('n_promos', *CONTROLES)):
+        self.precio, self.otras = precio, list(otras)
+
+    def _X(self, d, factor=1.0):
+        X = d[[self.precio] + self.otras].to_numpy(float).copy()
+        X[:, 0] *= factor
+        return (X - self.mu_) / self.sd_
+
+    def fit(self, d):
+        X = d[[self.precio] + self.otras].to_numpy(float)
+        self.mu_, self.sd_ = X.mean(axis=0), X.std(axis=0)
+        self.mu_[0], self.sd_[0] = 0.0, 1.0
+        self.sd_[self.sd_ == 0] = 1.0
+        self.m_ = LogisticRegression(penalty=None, max_iter=5000).fit(self._X(d), d['incidencia_compra'])
+        self.b_ = float(self.m_.coef_[0][0])
+        return self
+
+    def prob(self, d, factor=1.0):
+        return self.m_.predict_proba(self._X(d, factor))[:, 1]
+
+    def elasticidad(self, d):
+        return float(np.mean(self.b_ * d[self.precio].to_numpy() * (1 - self.prob(d))))
+
+indices_dia = df.groupby('dia_visita').indices
+def ic_dias(d, crear_modelo, n=N_BOOT_DIAS, semilla=SEMILLA):
+    """Intervalo de la elasticidad remuestreando días completos."""
+    rng = np.random.default_rng(semilla)
+    idx_dia = d.groupby('dia_visita').indices
+    claves = np.array(list(idx_dia))
+    vals = []
+    for _ in range(n):
+        filas_b = np.concatenate([idx_dia[k] for k in rng.choice(claves, len(claves))])
+        sub = d.iloc[filas_b]
+        vals.append(crear_modelo().fit(sub).elasticidad(sub))
+    return np.percentile(vals, [2.5, 97.5])
+
+# [Celda 46]
+ESPECIFICACIONES = {
+    'A. Solo precio medio': lambda: ModeloPrecio(otras=()),
+    'B. + marcas en promoción': lambda: ModeloPrecio(otras=('n_promos',)),
+    'C. + historia (principal)': lambda: ModeloPrecio(),
+    'D. C + efectos de trimestre': lambda: ModeloPrecio(otras=('n_promos', *CONTROLES, *TRIM)),
+    'E. C + efectos de mes': lambda: ModeloPrecio(otras=('n_promos', *CONTROLES, *MESES)),
+    'F. Precio de la marca preferida': lambda: ModeloPrecio('precio_preferida', ('promo_preferida', *CONTROLES)),
+}
+periodos = {'Desarrollo (días < 548)': df[df['dia_visita'] < INICIO_OOT], 'OOT': df[df['dia_visita'] >= INICIO_OOT], 'Total': df}
+filas = []
+for nombre, crear_m in ESPECIFICACIONES.items():
+    fila = {'Especificación': nombre}
+    for per, d in periodos.items():
+        fila[per] = round(crear_m().fit(d).elasticidad(d), 2)
+    filas.append(fila)
+robustez = pd.DataFrame(filas).set_index('Especificación')
+lo, hi = ic_dias(df, ESPECIFICACIONES['C. + historia (principal)'])
+modelo_total = ModeloPrecio().fit(df)
+ELASTICIDAD = modelo_total.elasticidad(df)
+print(f'Elasticidad principal (C, total): {ELASTICIDAD:.2f} | IC 95 % por días: {lo:.2f} a {hi:.2f}')
+robustez
+
+# --- 13.1 Prueba de nivel: ¿la elasticidad anticipa lo que pasó después? ---
+
+# [Celda 47]
+dev, fut = df[df['dia_visita'] < INICIO_OOT], df[df['dia_visita'] >= INICIO_OOT]
+con_precio = ModeloPrecio().fit(dev)
+sin_precio = ModeloPrecio('n_promos', CONTROLES).fit(dev)
+fut_ = fut.assign(con=con_precio.prob(fut), sin=sin_precio.prob(fut))
+nivel = fut_.groupby('mes').agg(**{'Precio medio': ('precio_medio', 'mean'), 'Tasa real': ('incidencia_compra', 'mean'),
+                                  'Modelo con precio': ('con', 'mean'), 'Modelo sin precio': ('sin', 'mean')})
+nivel.loc['Total OOT'] = [fut['precio_medio'].mean(), fut['incidencia_compra'].mean(), fut_['con'].mean(), fut_['sin'].mean()]
+print(f'Precio medio: desarrollo {dev["precio_medio"].mean():.3f} | OOT {fut["precio_medio"].mean():.3f} '
+      f'({fut["precio_medio"].mean() / dev["precio_medio"].mean() - 1:+.1%})')
+nivel.assign(**{c: nivel[c].map(pct) for c in ['Tasa real', 'Modelo con precio', 'Modelo sin precio']}).round(3)
+
+# [Celda 48]
+modelos_seg, elas_seg = {}, []
+for s in sorted(df['segmento'].unique()):
+    d = df[df['segmento'] == s]
+    modelos_seg[s] = ModeloPrecio().fit(d)
+    lo_s, hi_s = ic_dias(d, ModeloPrecio)
+    p_base = modelos_seg[s].prob(d)
+    elas_seg.append({'Segmento': NOMBRES[s], 'Visitas': len(d), 'Tasa de compra': pct(d['incidencia_compra'].mean()),
+                     'Coeficiente del precio': round(modelos_seg[s].b_, 2), 'Elasticidad': round(modelos_seg[s].elasticidad(d), 2),
+                     'IC 95 % (días)': f'{lo_s:.2f} a {hi_s:.2f}',
+                     'Cambio en compras si el precio sube 1 %': pct(modelos_seg[s].prob(d, 1.01).mean() / p_base.mean() - 1, 2)})
+display(pd.DataFrame(elas_seg).set_index('Segmento'))
+
+marca_m = ModeloPrecio(PRECIOS[0], (*PRECIOS[1:], *PROMOS, *CONTROLES)).fit(df)
+p_m = marca_m.prob(df)
+coefs = marca_m.m_.coef_[0][:5] / marca_m.sd_[:5]
+pd.DataFrame({'Marca': list(MARCAS), 'Precio medio': [df[p].mean() for p in PRECIOS],
+              'Elasticidad de la compra de la categoría': [float(np.mean(c * df[p] * (1 - p_m))) for c, p in zip(coefs, PRECIOS)]}).set_index('Marca').round(2)
+
+# [Celda 49]
+rejilla = np.linspace(df['precio_medio'].min(), df['precio_medio'].max(), 25)
+fig, (e1, e2) = plt.subplots(1, 2, figsize=(10, 3.9))
+for (s, mod), color in zip(modelos_seg.items(), [AZUL, NARANJA, VERDE, GRIS]):
+    d = df[df['segmento'] == s]
+    probs, elas = [], []
+    for precio in rejilla:
+        X = d.copy(); X['precio_medio'] = precio
+        p = mod.prob(X)
+        probs.append(p.mean() * 100); elas.append(np.mean(mod.b_ * precio * (1 - p)))
+    e1.plot(rejilla, probs, color=color, label=NOMBRES[s]); e2.plot(rejilla, elas, color=color, label=NOMBRES[s])
+e1.set(xlabel='Precio medio de la categoría', ylabel='Probabilidad de compra (%)', title='Respuesta de la compra al precio')
+e2.axhline(-1, color=TINTA, linestyle=':', linewidth=1)
+e2.annotate('Elasticidad unitaria', (rejilla[0], -1), xytext=(2, 4), textcoords='offset points', color=TINTA, fontsize=8)
+e2.set(xlabel='Precio medio de la categoría', ylabel='Elasticidad', title='Elasticidad por segmento')
+e2.legend(fontsize=8)
+plt.tight_layout(); fig.savefig('img/elasticidad_segmentos.png', dpi=130, bbox_inches='tight'); plt.show()
+print(f'Rango observado del precio medio: {rejilla[0]:.2f} a {rejilla[-1]:.2f}; las curvas no se extrapolan fuera de él.')
+
+# --- 13.2 Elección de marca: ¿qué producto compra? ---
+
+# [Celda 50]
+CUOTAS = [f'cuota_marca_{m}' for m in MARCAS]
+conteo_marca = np.column_stack([(df['id_marca'] == m).astype(int).groupby(df['id']).cumsum() - (df['id_marca'] == m).astype(int)
+                                for m in MARCAS])
+total_previas = conteo_marca.sum(axis=1, keepdims=True)
+df[CUOTAS] = np.where(total_previas > 0, conteo_marca / np.maximum(total_previas, 1), 1 / len(MARCAS))
+VARS_MARCA = PRECIOS + PROMOS + CUOTAS
+es_compra = df['incidencia_compra'].to_numpy() == 1
+tr_m, te_m = es_compra & mascara_train(INICIO_OOT), es_compra & en_oot
+
+def crear_modelo_marca():
+    return make_pipeline(StandardScaler(), LogisticRegression(max_iter=5000))
+
+modelo_marca = crear_modelo_marca().fit(df.loc[tr_m, VARS_MARCA], df.loc[tr_m, 'id_marca'])
+p_marca_te = modelo_marca.predict_proba(df.loc[te_m, VARS_MARCA])
+y_marca_te = df.loc[te_m, 'id_marca'].to_numpy()
+cuota_mercado = df.loc[tr_m, 'id_marca'].value_counts(normalize=True).sort_index().to_numpy()
+preferida_te = df.loc[te_m, CUOTAS].to_numpy().argmax(axis=1) + 1
+print(f'Compras: {int(tr_m.sum()):,} en desarrollo y {int(te_m.sum()):,} en OOT')
+pd.DataFrame({
+    'Acierto de la marca': [pct((y_marca_te == cuota_mercado.argmax() + 1).mean()), pct((preferida_te == y_marca_te).mean()),
+                            pct((modelo_marca.classes_[p_marca_te.argmax(axis=1)] == y_marca_te).mean())],
+    'Log loss': [round(log_loss(y_marca_te, np.tile(cuota_mercado, (len(y_marca_te), 1)), labels=list(MARCAS)), 3), np.nan,
+                 round(log_loss(y_marca_te, p_marca_te, labels=modelo_marca.classes_), 3)],
+}, index=['Cuotas de mercado', 'Marca preferida del cliente', 'Modelo multinomial'])
+
+# --- 13.3. Elasticidades de elección de marca ---
+
+# [Celda 51]
+compras = df[es_compra].reset_index(drop=True)
+modelo_marca_total = crear_modelo_marca().fit(compras[VARS_MARCA], compras['id_marca'])
+
+def matriz_eleccion(modelo, d):
+    base = modelo.predict_proba(d[VARS_MARCA]).mean(axis=0)
+    filas = []
+    for precio in PRECIOS:
+        x = d[VARS_MARCA].copy()
+        x[precio] = x[precio] * 1.01
+        filas.append(modelo.predict_proba(x).mean(axis=0) / base - 1)
+    return pd.DataFrame(filas, index=[f'Sube la marca {m}' for m in MARCAS], columns=[f'Marca {m}' for m in MARCAS])
+
+matriz = matriz_eleccion(modelo_marca_total, compras)
+rng = np.random.default_rng(SEMILLA)
+idx_dia_c = compras.groupby('dia_visita').indices
+claves_c = np.array(list(idx_dia_c))
+propias = []
+for _ in range(N_BOOT_DIAS):
+    sub = compras.iloc[np.concatenate([idx_dia_c[k] for k in rng.choice(claves_c, len(claves_c))])]
+    propias.append(np.diag(matriz_eleccion(crear_modelo_marca().fit(sub[VARS_MARCA], sub['id_marca']), sub)))
+propias = np.array(propias)
+display((matriz * 100).round(2))
+
+# Elasticidad total de comprar cada marca: incidencia de la categoría × elección de marca
+inc_base = marca_m.prob(df)
+elig_base = modelo_marca_total.predict_proba(df[VARS_MARCA])
+filas = []
+for j, precio in enumerate(PRECIOS):
+    x = df.copy()
+    x[precio] = x[precio] * 1.01
+    inc = marca_m.prob(x)
+    elig = modelo_marca_total.predict_proba(x[VARS_MARCA])[:, j]
+    filas.append({'Marca': j + 1, 'Participación en compras': pct((compras['id_marca'] == j + 1).mean()),
+                  'Incidencia de la categoría': round((inc.mean() / inc_base.mean() - 1) * 100, 2),
+                  'Elección de la marca': round(matriz.iloc[j, j] * 100, 2),
+                  'IC 95 % elección (días)': f'{np.percentile(propias[:, j], 2.5) * 100:.2f} a {np.percentile(propias[:, j], 97.5) * 100:.2f}',
+                  'Total: comprar esa marca': round(((inc * elig).mean() / (inc_base * elig_base[:, j]).mean() - 1) * 100, 2)})
+elasticidad_marca = pd.DataFrame(filas).set_index('Marca')
+elasticidad_marca
+
+# --- 13.4. ¿Comprará este cliente esta marca? ---
+
+# [Celda 52]
+oot_m = df.loc[en_oot]
+p_eleccion_oot = modelo_marca.predict_proba(oot_m[VARS_MARCA])
+conteo_oot = conteo_marca[en_oot]
+filas = []
+for j in range(len(MARCAS)):
+    y_j = (oot_m['id_marca'].to_numpy() == j + 1).astype(int)
+    regla_j = (conteo_oot[:, j] + SUAVIZADO * PRIOR * cuota_mercado[j]) / (oot_m['n_visitas_previas'].to_numpy() + SUAVIZADO)
+    combinado = scores[GANADOR] * p_eleccion_oot[:, j]
+    filas.append({'Marca': j + 1, 'Compras en OOT': int(y_j.sum()), 'Tasa por visita': pct(y_j.mean()),
+                  'Gini propensión sola': round(gini(y_j, scores[GANADOR]), 3),
+                  'Gini regla por marca': round(gini(y_j, regla_j), 3),
+                  'Gini propensión × elección': round(gini(y_j, combinado), 3),
+                  f'Tasa en el {CUPO:.0%} mejor puntuado': pct(tasa_cupo(y_j, combinado, CUPO))})
+pd.DataFrame(filas).set_index('Marca')
+
+# ==================================================================================================
+# 14. Captura de valor
+# ==================================================================================================
+
+# --- 14.1 Priorizar visitas con el modelo de propensión ---
+
+# [Celda 53]
+_, t_d = bootstrap(y_oot, {GANADOR: scores[GANADOR], REGLA: scores[REGLA]}, CUPOS, semilla=SEMILLA + 1)
+filas = []
+base = y_oot.mean()
+for i, c_ in enumerate(CUPOS):
+    k_ = int(len(y_oot) * c_)
+    tm, tr_ = tasa_cupo(y_oot, scores[GANADOR], c_), tasa_cupo(y_oot, scores[REGLA], c_)
+    dif = (t_d[GANADOR][:, i] - t_d[REGLA][:, i]) * 100
+    filas.append({'Cupo': f'{c_:.0%}', 'Visitas': k_, 'Tasa modelo': pct(tm),
+                  'IC 95 %': f'{pct(np.percentile(t_d[GANADOR][:, i], 2.5))} a {pct(np.percentile(t_d[GANADOR][:, i], 97.5))}',
+                  'Tasa regla': pct(tr_), 'Modelo − regla (puntos, IC 95 %)': f'{np.percentile(dif, 2.5):+.1f} a {np.percentile(dif, 97.5):+.1f}',
+                  'Lift': round(tm / base, 2), 'Captura': pct(tm * k_ / y_oot.sum())})
+print(f'Tasa base en OOT: {pct(base)} | lift máximo posible con cupo de {CUPO:.0%}: {min(1 / base, 1 / CUPO):.2f}')
+pd.DataFrame(filas).set_index('Cupo')
+
+# --- 14.2 Simular cambios del precio general ---
+
+# [Celda 54]
+pagado = df.loc[df['incidencia_compra'] == 1].assign(
+    precio_pagado=lambda d: d[PRECIOS].to_numpy()[np.arange(len(d)), d['id_marca'].to_numpy() - 1])
+ticket_seg = pagado.groupby('segmento').apply(lambda d: d['cantidad'].mean() * d['precio_pagado'].mean(), include_groups=False)
+print('Ticket medio por compra:', {NOMBRES[k]: round(v, 2) for k, v in ticket_seg.items()})
+
+def simular(cambio):
+    filas = []
+    for s, mod in modelos_seg.items():
+        d = oot[oot['segmento'] == s]
+        p = mod.prob(d, 1 + cambio)
+        ticket = ticket_seg[s] * (1 + cambio)
+        costo = ticket_seg[s] * (1 - MARGEN_BRUTO)
+        filas.append({'segmento': s, 'compras': p.sum(), 'ingreso': (p * ticket).sum(), 'margen': (p * (ticket - costo)).sum()})
+    return pd.DataFrame(filas)
+
+base_sim = simular(0.0)
+filas = []
+for cambio in [-0.05, -0.03, -0.01, 0.0, 0.01, 0.03, 0.05]:
+    r = simular(cambio)
+    fila = {'Cambio de precio': f'{cambio:+.0%}', 'Compras': f'{r["compras"].sum() / base_sim["compras"].sum() - 1:+.1%}',
+            'Ingreso': f'{r["ingreso"].sum() / base_sim["ingreso"].sum() - 1:+.1%}', 'Margen total': f'{r["margen"].sum() / base_sim["margen"].sum() - 1:+.1%}'}
+    for s in modelos_seg:
+        fila[f'Margen {NOMBRES[s]}'] = f'{r.loc[r["segmento"] == s, "margen"].sum() / base_sim.loc[base_sim["segmento"] == s, "margen"].sum() - 1:+.1%}'
+    filas.append(fila)
+pd.DataFrame(filas).set_index('Cambio de precio')
+
+# --- 14.3 A quién darle un descuento ---
+
+# [Celda 55]
+p0 = np.clip(scores[GANADOR].astype(float), 1e-6, 1 - 1e-6)
+b_vis = oot['segmento'].map({s: m.b_ for s, m in modelos_seg.items()}).to_numpy()
+p1 = 1 / (1 + np.exp(-(np.log(p0 / (1 - p0)) + b_vis * (-DESCUENTO * oot['precio_medio'].to_numpy()))))
+ticket_vis = oot['segmento'].map(ticket_seg).to_numpy()
+delta_p = p1 - p0
+margen_inc = ticket_vis * (p1 * (MARGEN_BRUTO - DESCUENTO) - p0 * MARGEN_BRUTO)
+k_cupo = int(len(p0) * CUPO)
+rng = np.random.default_rng(SEMILLA)
+estrategias = {'Al azar': rng.random(len(p0)), 'Mayor propensión': p0, 'Mayor aumento de probabilidad': delta_p,
+               'Mayor margen incremental': margen_inc}
+filas = []
+for nombre, criterio in estrategias.items():
+    sel = np.argsort(-criterio)[:k_cupo]
+    filas.append({'Estrategia': nombre, 'Ofertas': k_cupo, 'Propensión media sin oferta': pct(p0[sel].mean()),
+                  'Compras incrementales': round(delta_p[sel].sum(), 1), 'Compras subsidiadas': round(p0[sel].sum(), 1),
+                  'Costo del descuento': round((p1[sel] * ticket_vis[sel] * DESCUENTO).sum(), 1),
+                  'Margen incremental': round(margen_inc[sel].sum(), 1),
+                  'Visitas con margen positivo': int((margen_inc[sel] > 0).sum())})
+estr = pd.DataFrame(filas).set_index('Estrategia')
+print(f'Visitas OOT con margen incremental positivo: {int((margen_inc > 0).sum()):,} de {len(p0):,}')
+print('Segmento de las visitas con margen positivo:', oot.loc[margen_inc > 0, 'segmento'].map(NOMBRES).value_counts().to_dict())
+estr
+
+# --- 14.4 Impacto por área y cómo medir la captura de valor ---
+
+# ==================================================================================================
+# 15. Puesta en producción
+# ==================================================================================================
+
+# --- 15.1 Ficha del modelo ---
+
+# [Celda 56]
+ficha = {
+    'Modelo de propensión': GANADOR_ET,
+    'Variables': ', '.join(ajustes[GANADOR].variables),
+    'Hiperparámetros': {'lightgbm_ajustado': str(MEJORES_PARAMS), 'xgboost_ajustado': str(MEJORES_PARAMS_XGB)}.get(GANADOR[0], 'Valores por defecto'),
+    'Entrenamiento': f'{int(mascara_train(INICIO_OOT).sum()):,} visitas de los días 1 a {INICIO_OOT - 1}',
+    'Prueba fuera de tiempo': f'{len(y_oot):,} visitas de los días {INICIO_OOT} a {DIA_FINAL}, tasa {pct(y_oot.mean())}',
+    'Gini desarrollo (media de 3 bloques)': f'{resumen.loc[GANADOR_ET, "media"]:.3f}',
+    'Gini OOT (IC 95 %)': f'{base_gini:.3f} ({ic(g_boot[GANADOR])})',
+    f'Tasa en cupo de {CUPO:.0%}': f'{pct(tasa_cupo(y_oot, scores[GANADOR], CUPO))} frente a {pct(y_oot.mean())} al azar',
+    'Brier OOT': f'{brier_score_loss(y_oot, scores[GANADOR]):.4f}',
+    'Modelo de precio': 'Logística por segmento: precio medio, marcas en promoción y 3 controles de historia',
+    'Elasticidad total (IC 95 % por días)': f'{ELASTICIDAD:.2f} ({lo:.2f} a {hi:.2f})',
+    'Modelo de elección de marca': 'Multinomial: precios, promociones y cuota histórica de las 5 marcas',
+    'Acierto de la marca en OOT': pct((modelo_marca.classes_[p_marca_te.argmax(axis=1)] == y_marca_te).mean()),
+}
+pd.DataFrame({'Valor': ficha})
+
+# --- 15.2 Cómo se usa: entrenar con todo y puntuar ---
+
+# [Celda 57]
+modelo_final = ajustar(GANADOR[0], CONJUNTOS.get(GANADOR[1], []), np.ones(len(df), dtype=bool))
+
+def puntuar(historial):
+    """Historial con el formato de compras_data.csv. La última fila de cada cliente es la visita a puntuar;
+    su incidencia_compra, id_marca y cantidad no se usan, porque las variables solo miran visitas anteriores."""
+    d = construir_variables(historial)
+    d['segmento'] = d['id'].map(clientes['segmento'])
+    conteo = np.column_stack([(d['id_marca'] == m).astype(int).groupby(d['id']).cumsum() - (d['id_marca'] == m).astype(int)
+                              for m in MARCAS])
+    total = conteo.sum(axis=1, keepdims=True)
+    d[CUOTAS] = np.where(total > 0, conteo / np.maximum(total, 1), 1 / len(MARCAS))
+    ultima = d.groupby('id').tail(1)
+    p_compra = modelo_final.predecir(ultima)
+    p_eleccion = modelo_marca_total.predict_proba(ultima[VARS_MARCA])
+    salida = pd.DataFrame({'id': ultima['id'].to_numpy(), 'dia_visita': ultima['dia_visita'].to_numpy(),
+                           'segmento': ultima['segmento'].map(NOMBRES).to_numpy(), 'p_compra': p_compra})
+    for m in MARCAS:
+        salida[f'p_marca_{m}'] = p_compra * p_eleccion[:, m - 1]
+    return salida
+
+ejemplo = puntuar(crudo[crudo['dia_visita'] <= DIA_FINAL])
+ejemplo.sort_values('p_compra', ascending=False).head(5).round(3)
+
+# --- 15.3 El modelo fuera del notebook ---
+
+# [Celda 58]
+Path('modelo').mkdir(exist_ok=True)
+artefactos = {
+    'version': '1.0', 'entrenado_hasta_dia': DIA_FINAL,
+    'propension': modelo_final.modelo, 'vars_propension': modelo_final.variables,
+    'marca': modelo_marca_total, 'vars_marca': VARS_MARCA,
+    'prior': float(PRIOR), 'suavizado': SUAVIZADO, 'dias_max': DIAS_MAX,
+    'escalador_segmento': StandardScaler().fit(clientes[DEMO]), 'kmeans': km,
+    'orden_segmentos': {int(s): i for i, s in enumerate(orden_ingreso)}, 'nombres': NOMBRES,
+}
+joblib.dump(artefactos, 'modelo/modelo_propension.joblib')
+
+print(f'Modelo guardado: {Path("modelo/modelo_propension.joblib").stat().st_size / 1024:.0f} KB')
+if Path('puntuar.py').is_file():
+    from puntuar import puntuar as puntuar_script
+    desde_script = puntuar_script(crudo[crudo['dia_visita'] <= DIA_FINAL], joblib.load('modelo/modelo_propension.joblib'))
+    columnas_p = ['p_compra'] + [f'p_marca_{m}' for m in MARCAS]
+    assert (desde_script['id'].to_numpy() == ejemplo['id'].to_numpy()).all()
+    assert np.allclose(desde_script[columnas_p].to_numpy(), ejemplo[columnas_p].to_numpy()), 'El script no coincide con el notebook'
+    assert (desde_script['segmento'].to_numpy() == ejemplo['segmento'].to_numpy()).all(), 'Los segmentos no coinciden'
+    print(f'puntuar.py reproduce el notebook en los {len(desde_script)} clientes: probabilidades y segmentos idénticos')
+else:
+    print('puntuar.py no está junto al notebook: se omite la verificación del script')
+
+# --- 15.4 Arquitectura propuesta en la nube ---
+
+# --- 15.5 Plan de monitoreo ---
+
+# --- 15.6 Cronograma de implementación propuesto ---
+
+# ==================================================================================================
+# 16. Limitaciones
+# ==================================================================================================
+
+# ==================================================================================================
+# Conclusión
+# ==================================================================================================
+
+
+# ##################################################################################################
+# PARTE 2. puntuar.py
+# ##################################################################################################
+
+"""Puntúa la próxima visita de cada cliente con los modelos entrenados en el notebook.
+
+Uso:
+    python puntuar.py --historial data/compras_data.csv --salida puntuaciones.csv
+
+El historial tiene el formato de compras_data.csv. La última fila de cada cliente es la visita
+que se quiere puntuar, con los precios y promociones de ese día. Sus columnas de resultado
+(incidencia_compra, id_marca, cantidad) pueden venir vacías, porque las variables solo usan
+visitas anteriores.
+
+Salida: una fila por cliente con la probabilidad de compra (p_compra), la probabilidad de comprar
+cada marca (p_marca_1 a p_marca_5) y su segmento.
+"""
+import argparse
+from pathlib import Path
+
+import joblib
+import numpy as np
+import pandas as pd
+
+MARCAS = range(1, 6)
+PRECIOS = [f'precio_marca_{m}' for m in MARCAS]
+PROMOS = [f'promo_marca_{m}' for m in MARCAS]
+CUOTAS = [f'cuota_marca_{m}' for m in MARCAS]
+DEMO = ['genero', 'estado_civil', 'edad', 'nivel_educacion', 'ingreso_anual', 'ocupacion']
+RESULTADO = ['incidencia_compra', 'id_marca', 'cantidad']
+REQUERIDAS = ['id', 'dia_visita'] + RESULTADO + PRECIOS + PROMOS + DEMO
+MODELO_POR_DEFECTO = Path(__file__).with_name('modelo') / 'modelo_propension.joblib'
+
+
+def construir_variables(historial, prior, suavizado, dias_max):
+    """Variables de cada visita calculadas solo con las visitas anteriores del cliente."""
+    d = historial.sort_values(['id', 'dia_visita'], kind='stable').reset_index(drop=True)
+    d[RESULTADO] = d[RESULTADO].fillna(0)
+    g = d.groupby('id')
+    # Se recalculan desde el historial; en el archivo original equivalen a ultima_marca_comprada
+    # (marca de la visita anterior) y ultima_cantidad_comprada (0/1 de compra en la visita anterior)
+    d['ultima_marca_comprada'] = g['id_marca'].shift().fillna(0).astype(int)
+    d['compro_visita_anterior'] = g['incidencia_compra'].shift().fillna(0).astype(int)
+    d['n_visitas_previas'] = g.cumcount()
+    d['compras_previas'] = g['incidencia_compra'].cumsum() - d['incidencia_compra']
+    d['tasa_historica'] = (d['compras_previas'] + suavizado * prior) / (d['n_visitas_previas'] + suavizado)
+    d['dias_desde_visita'] = g['dia_visita'].diff().fillna(0)
+    dia_compra = d['dia_visita'].where(d['incidencia_compra'] == 1)
+    ultima = dia_compra.groupby(d['id']).transform(lambda s: s.ffill().shift())
+    d['dias_desde_compra'] = (d['dia_visita'] - ultima).fillna(dias_max).clip(upper=dias_max)
+    # Cuota histórica de cada marca en las compras anteriores (lealtad)
+    conteo = np.column_stack([(d['id_marca'] == m).astype(int).groupby(d['id']).cumsum() - (d['id_marca'] == m).astype(int)
+                              for m in MARCAS])
+    total = conteo.sum(axis=1, keepdims=True)
+    d[CUOTAS] = np.where(total > 0, conteo / np.maximum(total, 1), 1 / len(MARCAS))
+    return d
+
+
+def puntuar(historial, artefactos):
+    """Devuelve las probabilidades de la última visita de cada cliente."""
+    faltan = [c for c in REQUERIDAS if c not in historial.columns]
+    if faltan:
+        raise ValueError(f'Faltan columnas en el historial: {faltan}')
+    d = construir_variables(historial, artefactos['prior'], artefactos['suavizado'], artefactos['dias_max'])
+    ultima = d.groupby('id').tail(1)
+    p_compra = artefactos['propension'].predict_proba(ultima[artefactos['vars_propension']])[:, 1]
+    p_eleccion = artefactos['marca'].predict_proba(ultima[artefactos['vars_marca']])
+    etiqueta = artefactos['kmeans'].predict(artefactos['escalador_segmento'].transform(ultima[DEMO]))
+    segmento = [artefactos['nombres'][artefactos['orden_segmentos'][int(k)]] for k in etiqueta]
+    salida = pd.DataFrame({'id': ultima['id'].to_numpy(), 'dia_visita': ultima['dia_visita'].to_numpy(),
+                           'segmento': segmento, 'p_compra': p_compra})
+    for m in MARCAS:
+        salida[f'p_marca_{m}'] = p_compra * p_eleccion[:, m - 1]
+    return salida
+
+
+def main():
+    parser = argparse.ArgumentParser(description='Puntúa la próxima visita de cada cliente.')
+    parser.add_argument('--historial', required=True, help='CSV con el formato de compras_data.csv')
+    parser.add_argument('--salida', required=True, help='CSV de salida con las probabilidades')
+    parser.add_argument('--modelo', default=str(MODELO_POR_DEFECTO), help='Archivo .joblib generado por el notebook')
+    args = parser.parse_args()
+
+    artefactos = joblib.load(args.modelo)
+    historial = pd.read_csv(args.historial)
+    resultado = puntuar(historial, artefactos)
+    resultado.to_csv(args.salida, index=False)
+    print(f'Modelo versión {artefactos["version"]}, entrenado hasta el día {artefactos["entrenado_hasta_dia"]}')
+    print(f'{len(resultado):,} clientes puntuados | p_compra media {resultado["p_compra"].mean():.1%} | salida: {args.salida}')
+
+
+if __name__ == '__main__':
+    main()

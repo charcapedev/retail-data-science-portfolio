@@ -1,0 +1,331 @@
+<!doctype html>
+<html lang="es">
+<head>
+<meta charset="utf-8">
+<title>Documentación de la solución: propensión de compra y pricing</title>
+<style>
+  @page { size: A4; margin: 18mm 17mm 18mm 17mm; }
+  :root { --tinta: #22211f; --suave: #5b5a56; --linea: #dcdad4; --azul: #2a78d6; --fondo: #f4f3ef; }
+  * { box-sizing: border-box; }
+  body { font-family: "Segoe UI", Arial, sans-serif; color: var(--tinta); font-size: 10pt; line-height: 1.45; margin: 0; background: #fff; }
+  h1 { font-size: 22pt; margin: 0 0 4pt; letter-spacing: -0.3pt; }
+  h2 { font-size: 14pt; margin: 18pt 0 6pt; padding-bottom: 3pt; border-bottom: 1.5pt solid var(--azul); break-after: avoid; }
+  h3 { font-size: 11pt; margin: 12pt 0 4pt; break-after: avoid; }
+  p { margin: 0 0 6pt; }
+  ul, ol { margin: 0 0 6pt; padding-left: 16pt; }
+  li { margin-bottom: 2pt; }
+  table { border-collapse: collapse; width: 100%; margin: 4pt 0 8pt; font-size: 9pt; break-inside: avoid; }
+  th, td { border-bottom: 0.6pt solid var(--linea); padding: 3pt 5pt; text-align: left; vertical-align: top; }
+  th { background: var(--fondo); font-weight: 600; }
+  td.n, th.n { text-align: right; font-variant-numeric: tabular-nums; }
+  tr.destacado td { font-weight: 600; }
+  figure { margin: 6pt 0 10pt; break-inside: avoid; }
+  figure img { max-width: 100%; max-height: 92mm; width: auto; display: block; margin: 0 auto; }
+  .bloque { break-inside: avoid; }
+  figcaption { font-size: 8.5pt; color: var(--suave); margin-top: 3pt; }
+  .portada { border-bottom: 1pt solid var(--linea); padding-bottom: 10pt; margin-bottom: 10pt; }
+  .sub { color: var(--suave); font-size: 11pt; }
+  .caja { background: var(--fondo); border-left: 3pt solid var(--azul); padding: 7pt 10pt; margin: 6pt 0 10pt; break-inside: avoid; }
+  .caja p:last-child, .caja ul:last-child { margin-bottom: 0; }
+  .kpis { display: flex; gap: 8pt; margin: 8pt 0 10pt; }
+  .kpi { flex: 1; border: 0.6pt solid var(--linea); border-radius: 4pt; padding: 6pt 8pt; }
+  .kpi b { display: block; font-size: 16pt; color: var(--azul); }
+  .kpi span { font-size: 8.5pt; color: var(--suave); }
+  pre { font-family: Consolas, monospace; font-size: 8pt; background: var(--fondo); padding: 7pt; white-space: pre; break-inside: avoid; margin: 4pt 0 8pt; line-height: 1.3; }
+  code { font-family: Consolas, monospace; font-size: 8.5pt; background: var(--fondo); padding: 0 2pt; }
+  .salto { break-before: page; }
+  .dos { display: flex; gap: 10pt; }
+  .dos > * { flex: 1; }
+</style>
+</head>
+<body>
+
+<div class="portada">
+  <h1>Propensión de compra y pricing</h1>
+  <p class="sub">Documentación de la solución: objetivos, arquitectura, metodología y resultados</p>
+</div>
+
+<h2>1. Resumen ejecutivo</h2>
+<p>Se construyó una solución que estima, para cada visita de un cliente a la tienda, la probabilidad de que compre en la categoría y la probabilidad de que compre cada una de sus 5 marcas. Además, mide cuánto responde la compra al precio. La solución se validó en los últimos seis meses de datos, que no se usaron para construirla.</p>
+<div class="kpis">
+  <div class="kpi"><b>0.448</b><span>Gini fuera de tiempo del modelo de propensión (IC 95&nbsp;%: 0.406 a 0.488)</span></div>
+  <div class="kpi"><b>51.4&nbsp;%</b><span>de compra en el 20&nbsp;% de visitas mejor puntuadas, frente a 25.2&nbsp;% al azar</span></div>
+  <div class="kpi"><b>−3.3</b><span>elasticidad de corto plazo de la compra al precio medio de la categoría</span></div>
+  <div class="kpi"><b>78.5&nbsp;%</b><span>de las compras son de la marca que el cliente ya prefería</span></div>
+</div>
+<div class="caja">
+<p><b>Recomendaciones</b></p>
+<ul>
+  <li>Usar el modelo de propensión, de solo 4 variables, para priorizar acciones comerciales con cupos de 20&nbsp;% o más de las visitas.</li>
+  <li>No bajar el precio general: aumenta las compras, pero reduce el margen. Probar un aumento moderado con un diseño controlado, empezando por la marca 5, la menos sensible a su precio.</li>
+  <li>No dar descuentos a quienes más probablemente compran: se subsidian compras que ocurrirían igual. Si se ofrecen, deben dirigirse a visitas de baja propensión en los segmentos sensibles al precio, dentro de un piloto con grupo de control.</li>
+</ul>
+</div>
+
+<h2>2. Objetivos</h2>
+<table>
+  <tr><th>Tipo</th><th>Objetivo</th><th>Cómo se mide</th></tr>
+  <tr><td>Negocio</td><td>Anticipar qué clientes comprarán, y qué producto, para dirigir acciones comerciales</td><td>Tasa de compra y captura en el cupo, frente al azar y a una regla simple</td></tr>
+  <tr><td>Negocio</td><td>Entender cómo responde la demanda al precio para decidir precios y promociones</td><td>Elasticidad por segmento y por marca, con intervalos de confianza</td></tr>
+  <tr><td>Negocio</td><td>Traducir los modelos en decisiones con valor económico medible</td><td>Margen incremental y KPIs por área, medidos con grupo de control</td></tr>
+  <tr><td>Técnico</td><td>Un modelo sin fuga de información, estable en el tiempo e interpretable</td><td>Validación temporal, PSI, SHAP y prueba fuera de tiempo</td></tr>
+  <tr><td>Técnico</td><td>Una solución reproducible y operable</td><td>Notebook que se ejecuta de principio a fin y función de puntuación</td></tr>
+</table>
+
+<h2>3. Datos y calidad</h2>
+<p>El archivo <code>compras_data.csv</code> tiene 58,693 visitas de 500 clientes durante 730 días. Cada fila incluye si hubo compra, la marca y la cantidad, el precio y la promoción del día de 5 marcas de una categoría y el perfil del cliente. La tasa de compra es 24.9&nbsp;%.</p>
+<table>
+  <tr><th>Revisión</th><th>Resultado</th><th>Tratamiento</th></tr>
+  <tr><td>Nulos, duplicados y coherencia entre compra, marca y cantidad</td><td>Sin problemas</td><td>Ninguno</td></tr>
+  <tr><td>Precio y promoción</td><td>Iguales para todos los clientes de un mismo día</td><td>Se tratan como variables del día; la elasticidad se remuestrea por días</td></tr>
+  <tr><td><code>ultima_marca_comprada</code></td><td>Es la marca de la <b>visita anterior</b> (100&nbsp;% de coincidencia), no la de la última compra</td><td>Se usa con su significado real</td></tr>
+  <tr><td><code>ultima_cantidad_comprada</code></td><td>Es un indicador 0/1 de compra en la visita anterior (100&nbsp;%), no una cantidad (81.2&nbsp;%)</td><td>Se renombra como <code>compro_visita_anterior</code></td></tr>
+  <tr><td>Días 728 a 730</td><td>139 visitas y 0 compras; con una tasa de 25&nbsp;%, la probabilidad es 4 × 10⁻¹⁸</td><td>Registro incompleto: se excluyen</td></tr>
+  <tr><td><code>tamanio_ciudad</code></td><td>El diccionario indica no considerarla</td><td>Excluida</td></tr>
+  <tr><td><code>id_marca</code> y <code>cantidad</code></td><td>Son el resultado de la visita</td><td>Excluidas como predictores (fuga de información)</td></tr>
+</table>
+
+<h2>4. Arquitectura de la solución</h2>
+<h3>4.1 Lógica analítica</h3>
+<pre>
+ Visitas (58,554)  ──►  Variables sin fuga (30 candidatas: historia, precio, perfil)
+                                   │
+          ┌────────────────────────┼─────────────────────────────┐
+          ▼                        ▼                             ▼
+ Segmentación K-Means      Selección de variables        Variables de precio y lealtad
+ (3 segmentos)             (8 de 30)                             │
+          │                        │                             │
+          │                        ▼                             ▼
+          │          Modelo de propensión            Modelo de elección de marca
+          │          P(compra) · XGBoost             P(marca | compra) · multinomial
+          │                        │                             │
+          ▼                        └──────────────┬──────────────┘
+ Elasticidad por segmento                         ▼
+ (logística de respuesta al precio)     P(compra de la marca j) = P(compra) × P(j | compra)
+          │                                       │
+          └──────────────────┬────────────────────┘
+                             ▼
+     Decisiones: priorizar visitas · fijar precios · elegir a quién dar descuentos
+</pre>
+<h3>4.2 Despliegue propuesto en la nube</h3>
+<p>El diseño separa el entrenamiento mensual de la puntuación diaria. Puede implementarse con servicios administrados de cualquier proveedor.</p>
+<pre>
+ Punto de venta, CRM y precios ──► Data lake (archivos crudos por día)
+                                         │
+                                         ▼
+                 Proceso diario de variables (historia, precio, segmento)
+                                         │
+              ┌──────────────────────────┴───────────────────────────┐
+              ▼                                                      ▼
+   Entrenamiento mensual                                   Puntuación diaria o en línea
+   (reentrena, compara con el vigente,                     (API para la app o la caja,
+    registra versión y ficha)                               lote nocturno para el CRM)
+              └──────────────► Registro de modelos ◄─────────────────┘
+                                         │
+                                         ▼
+         Tablero de monitoreo: PSI, Gini, calibración y resultados del grupo de control
+</pre>
+<table>
+  <tr><th>Componente</th><th>AWS</th><th>Azure</th><th>Google Cloud</th></tr>
+  <tr><td>Almacenamiento</td><td>S3</td><td>Data Lake Storage</td><td>Cloud Storage</td></tr>
+  <tr><td>Variables y orquestación</td><td>Glue, Step Functions</td><td>Data Factory</td><td>Dataflow, Cloud Composer</td></tr>
+  <tr><td>Entrenamiento y registro</td><td>SageMaker</td><td>Azure Machine Learning</td><td>Vertex AI</td></tr>
+  <tr><td>Puntuación</td><td>Endpoint de SageMaker o Lambda</td><td>Endpoint administrado</td><td>Endpoint de Vertex AI</td></tr>
+  <tr><td>Monitoreo</td><td>CloudWatch y QuickSight</td><td>Azure Monitor y Power BI</td><td>Cloud Monitoring y Looker</td></tr>
+</table>
+<div class="bloque">
+<h3>4.3 Cómo opera</h3>
+<table>
+  <tr><th>Aspecto</th><th>Decisión</th><th>Por qué</th></tr>
+  <tr><td>Puntuación</td><td>Lote nocturno con los precios del día siguiente; API en línea solo si la oferta se muestra en el momento de la visita</td><td>Hay unas 80 visitas por día: un lote basta para el CRM</td></tr>
+  <tr><td>Latencia en línea</td><td>Milisegundos por cliente</td><td>4 variables y árboles de 2 niveles; la historia del cliente se precalcula cada noche</td></tr>
+  <tr><td>Reentrenamiento</td><td>Mensual, o antes si el PSI del score supera 0.25</td><td>El entrenamiento completo toma unos 2 minutos</td></tr>
+  <tr><td>Versiones</td><td>Cada modelo se registra con su ficha; reemplaza al vigente solo si no ordena peor en el último mes, evaluado fuera de tiempo</td><td>Misma lógica de campeón y retador del análisis</td></tr>
+  <tr><td>Datos personales</td><td>Perfil cifrado y con acceso por roles; las salidas usan el <code>id</code></td><td>El modelo de propensión no usa género, edad ni ingreso</td></tr>
+  <tr><td>Costo</td><td>Bajo: sin GPU, una instancia pequeña bajo demanda y almacenamiento de objetos</td><td>Volumen pequeño y entrenamiento corto</td></tr>
+</table>
+</div>
+<div class="bloque">
+<h3>4.4 Artefactos operables</h3>
+<p>El notebook guarda en <code>modelo/modelo_propension.joblib</code> el modelo de propensión, el de elección de marca, la segmentación y los parámetros de las variables (367 KB). El script <code>puntuar.py</code> lo carga, reconstruye las variables desde el historial y devuelve, para la última visita de cada cliente, <code>p_compra</code>, <code>p_marca_1</code> a <code>p_marca_5</code> y el segmento. La última visita puede venir sin resultado, como ocurre con una visita futura. El notebook verifica que el script reproduzca exactamente sus probabilidades en los 500 clientes.</p>
+<pre>python puntuar.py --historial data/compras_data.csv --salida puntuaciones.csv</pre>
+<p>En la nube, este mismo script es el paso de puntuación del lote nocturno, y su función <code>puntuar</code> es el núcleo de una API en línea.</p>
+</div>
+
+<h2>5. Metodología paso a paso</h2>
+<table>
+  <tr><th>#</th><th>Paso</th><th>Qué se hace y por qué</th></tr>
+  <tr><td>1</td><td>Calidad de datos</td><td>Se contrasta cada columna con el diccionario y se detectan anomalías (sección 3).</td></tr>
+  <tr><td>2</td><td>Variables sin fuga</td><td>30 candidatas calculadas solo con visitas anteriores: tasa histórica de compra suavizada, días desde la última compra y visita, marca anterior y preferida, precios, promociones y perfil.</td></tr>
+  <tr><td>3</td><td>Análisis exploratorio</td><td>Patrones de tiempo, precio, promociones, historia y perfil (sección 6.1).</td></tr>
+  <tr><td>4</td><td>Diseño temporal</td><td>Tres bloques de desarrollo (días 274 a 547), cada uno evaluado con un modelo entrenado con los días anteriores. Los días 548 a 727 (13,331 visitas) se reservan como prueba fuera de tiempo (OOT).</td></tr>
+  <tr><td>5</td><td>Segmentación</td><td>K-Means sobre el perfil demográfico estandarizado. El número de grupos se elige por estabilidad bootstrap (ARI).</td></tr>
+  <tr><td>6</td><td>Selección de variables</td><td>Criterio experto, concentración (≤ 95&nbsp;%), estabilidad (PSI ≤ 0.25), IV y Gini por bloque, coherencia de signo y correlación de Spearman (≤ 0.85) con VIF.</td></tr>
+  <tr><td>7</td><td>Campeón, retadores y ajuste fino</td><td>Regla simple, logística, LightGBM y XGBoost; estos dos, con sus valores por defecto y con una búsqueda aleatoria de 20 combinaciones de hiperparámetros. En tres conjuntos de variables suman 16 configuraciones. Se elige con <code>robusto = media − desviación</code> del Gini y, dentro de una tolerancia de 0.01, el más simple.</td></tr>
+  <tr><td>8</td><td>Evaluación OOT</td><td>Gini, precisión media, tasa en el cupo y bootstrap pareado por cliente para los intervalos.</td></tr>
+  <tr><td>9</td><td>Calibración y sensibilidad</td><td>Calibración por decil, demanda semanal, validación aleatoria, clientes no vistos, grupos de variables y semillas.</td></tr>
+  <tr><td>10</td><td>Interpretabilidad y equidad</td><td>SHAP, odds ratios y comparación por género, edad y segmento.</td></tr>
+  <tr><td>11</td><td>Elasticidad de precio</td><td>Logística de respuesta al precio por segmento, con controles de historia, seis especificaciones de robustez, intervalos por remuestreo de días y una prueba de nivel fuera de tiempo.</td></tr>
+  <tr><td>12</td><td>Elección de marca</td><td>Regresión multinomial con precios, promociones y lealtad; elasticidades propias y cruzadas; probabilidad de comprar cada marca.</td></tr>
+  <tr><td>13</td><td>Captura de valor</td><td>Tabla por cupo, simulación de precios, estrategia de descuentos, KPIs por área y plan de monitoreo.</td></tr>
+</table>
+
+<h2>6. Resultados</h2>
+<h3>6.1 Análisis exploratorio</h3>
+<figure><img src="../../img/tasa_compra_mensual.png" alt="Tasa de compra, precio medio y visitas por mes"><figcaption>Figura 1. La tasa arranca baja con la tienda recién abierta y se estabiliza entre 23&nbsp;% y 29&nbsp;% desde el mes 4. En la prueba OOT el precio medio sube y la tasa no cae.</figcaption></figure>
+<figure><img src="../../img/eda_patrones.png" alt="Patrones de compra por precio, promociones e historia"><figcaption>Figura 2. La compra baja con el precio y sube con las promociones, pero la señal más fuerte es la historia del cliente.</figcaption></figure>
+<ul>
+  <li><b>Historia.</b> Tras una visita con compra, la tasa es 41.0&nbsp;%; tras una sin compra, 19.7&nbsp;%. La tasa de cada cliente se mantiene entre años (correlación de 0.76), y el 10&nbsp;% de clientes que más compra concentra 32.1&nbsp;% de las compras.</li>
+  <li><b>Marcas.</b> La marca 5, la más cara, es la más comprada (34.0&nbsp;%), seguida de la marca 2 (31.0&nbsp;%). Las marcas 1 y 2 están en promoción en cerca de un tercio de los días; las marcas 3 y 5 casi nunca.</li>
+  <li><b>Perfil.</b> La tasa sube con el ingreso (de 20.1&nbsp;% a 31.5&nbsp;% entre quintiles) y con la edad (de 20.0&nbsp;% a 29.0&nbsp;%), con diferencias menores que las de historia.</li>
+</ul>
+
+<h3>6.2 Segmentación</h3>
+<p>Con 3 segmentos la agrupación es la más estable (ARI de 0.839). La silueta es baja (0.27): los segmentos son un resumen útil, no grupos naturales bien separados.</p>
+<table>
+  <tr><th>Segmento</th><th class="n">Clientes</th><th>Perfil</th><th class="n">Tasa de compra</th><th class="n">Elasticidad</th></tr>
+  <tr><td>Jóvenes de menor ingreso</td><td class="n">187</td><td>32 años, ingreso de 102 mil</td><td class="n">21.2&nbsp;%</td><td class="n">−3.68</td></tr>
+  <tr><td>Adultos de ingreso medio</td><td class="n">206</td><td>37 años, ingreso de 119 mil</td><td class="n">26.5&nbsp;%</td><td class="n">−4.16</td></tr>
+  <tr><td>Mayores de mayor ingreso</td><td class="n">107</td><td>55 años, ingreso de 160 mil, más educación</td><td class="n">28.8&nbsp;%</td><td class="n">−0.58</td></tr>
+</table>
+
+<h3>6.3 Selección de variables</h3>
+<p>De 30 candidatas quedan 8: tasa histórica, días desde la última compra, marca de la visita anterior, días desde la visita anterior, edad, ingreso, ocupación y segmento.</p>
+<ul>
+  <li><b>Todas las variables de precio salen.</b> Diez tienen un PSI de 0.65 a 10.5, porque el nivel de precios cambia por épocas, y las demás no separan a quienes compran. El precio es igual para todos en un día, así que no dice quién compra más. Su efecto se mide aparte, con el modelo de elasticidad.</li>
+  <li><b><code>n_visitas_previas</code> es inestable por construcción</b> (PSI de 8.0): crece con la antigüedad de la tienda.</li>
+  <li><b><code>compro_visita_anterior</code> sale por redundancia:</b> tiene una correlación de 0.988 con la marca de la visita anterior.</li>
+</ul>
+
+<h3>6.4 Modelo de propensión</h3>
+<p>Solo podían ser elegidas las configuraciones que respetan la selección de variables. Ganó un <b>XGBoost ajustado con 4 variables de historia</b> (800 árboles de 2 niveles, tasa de aprendizaje de 0.03). LightGBM ajustado con las mismas variables queda a 0.003 de puntaje robusto: los dos algoritmos empatan en la práctica.</p>
+<table>
+  <tr><th>Modelo</th><th class="n">Variables</th><th class="n">Gini desarrollo</th><th class="n">Gini OOT (IC 95&nbsp;%)</th><th class="n">Compra en el 20&nbsp;%</th></tr>
+  <tr class="destacado"><td>Elegido: XGBoost ajustado, historia</td><td class="n">4</td><td class="n">0.485</td><td class="n">0.448 (0.406 a 0.488)</td><td class="n">51.4&nbsp;%</td></tr>
+  <tr><td>LightGBM ajustado, historia</td><td class="n">4</td><td class="n">0.483</td><td class="n">0.451 (0.410 a 0.491)</td><td class="n">51.3&nbsp;%</td></tr>
+  <tr><td>LightGBM ajustado, 30 candidatas</td><td class="n">30</td><td class="n">0.475</td><td class="n">0.440 (0.399 a 0.480)</td><td class="n">51.1&nbsp;%</td></tr>
+  <tr><td>Campeón: logística, 30 candidatas</td><td class="n">30</td><td class="n">0.476</td><td class="n">0.405 (0.360 a 0.449)</td><td class="n">50.0&nbsp;%</td></tr>
+  <tr><td>Regla: tasa histórica</td><td class="n">1</td><td class="n">0.454</td><td class="n">0.371 (0.320 a 0.418)</td><td class="n">48.4&nbsp;%</td></tr>
+  <tr><td>Azar</td><td class="n">0</td><td class="n">0</td><td class="n">0</td><td class="n">25.2&nbsp;%</td></tr>
+</table>
+<div class="dos">
+<figure><img src="../../img/curva_ganancia_oot.png" alt="Curva de ganancia OOT"><figcaption>Figura 3. Con el 20&nbsp;% de las visitas se alcanza el 40.9&nbsp;% de las compras.</figcaption></figure>
+<div>
+<ul>
+  <li><b>Supera al campeón y a la regla</b>, con intervalos que excluyen el cero: +0.042 de Gini sobre el campeón y +0.077 sobre la regla. Frente a LightGBM con las mismas 4 variables, la diferencia es −0.003: un empate práctico.</li>
+  <li><b>Calibración buena:</b> predice 25.2&nbsp;% y ocurre 25.2&nbsp;%, y el Brier mejora 14&nbsp;% frente a asignar la misma tasa a todos.</li>
+  <li><b>Robusto:</b> funciona igual con 100 clientes que no vio (Gini 0.390 frente a 0.391), no depende de la semilla (0.448 a 0.449) y empeora si se le agregan las variables de precio (0.431).</li>
+  <li><b>Interpretación:</b> la tasa histórica es la variable dominante. Una desviación más multiplica por 2.04 las chances de comprar.</li>
+</ul>
+</div>
+</div>
+
+<h3>6.5 Pricing: elasticidad de la compra</h3>
+<figure><img src="../../img/elasticidad_segmentos.png" alt="Elasticidad por segmento"><figcaption>Figura 4. Dos segmentos son muy sensibles al precio; los mayores de mayor ingreso casi no lo son.</figcaption></figure>
+<ul>
+  <li><b>Elasticidad total de −3.29</b> (IC por días de −4.75 a −0.74). Es negativa en las seis especificaciones probadas, incluidas las que controlan por trimestre o por mes.</li>
+  <li><b>Lo que importa es el precio de la categoría,</b> sobre todo el de las marcas baratas, no el de la marca habitual del cliente.</li>
+  <li><b>Prueba de nivel.</b> El modelo estimado en desarrollo anticipaba 23.3&nbsp;% de compra en la prueba OOT, donde el precio fue 2.8&nbsp;% más alto. Ocurrió 25.2&nbsp;%. La elasticidad describe la respuesta de corto plazo (en qué día comprar), no la de un cambio sostenido.</li>
+</ul>
+
+<div class="bloque">
+<h3>6.6 Elección de marca y probabilidad por producto</h3>
+<table>
+  <tr><th>Marca</th><th class="n">Participación</th><th class="n">Elasticidad total a su precio</th><th class="n">Gini OOT combinado</th><th class="n">Gini OOT regla por marca</th></tr>
+  <tr><td>1 (la más barata)</td><td class="n">9.2&nbsp;%</td><td class="n">−6.79</td><td class="n"><b>0.529</b></td><td class="n">0.515</td></tr>
+  <tr><td>2</td><td class="n">31.0&nbsp;%</td><td class="n">−2.44</td><td class="n"><b>0.627</b></td><td class="n">0.560</td></tr>
+  <tr><td>3</td><td class="n">5.7&nbsp;%</td><td class="n">No identificable</td><td class="n">0.755</td><td class="n"><b>0.790</b></td></tr>
+  <tr><td>4</td><td class="n">20.0&nbsp;%</td><td class="n">−2.08</td><td class="n">0.784</td><td class="n"><b>0.798</b></td></tr>
+  <tr><td>5 (la más cara)</td><td class="n">34.0&nbsp;%</td><td class="n">−0.51</td><td class="n"><b>0.863</b></td><td class="n">0.842</td></tr>
+</table>
+<p>La marca la decide sobre todo la lealtad: la marca preferida del cliente acierta en 78.5&nbsp;% de las compras, y el modelo multinomial reduce la log loss de 1.514 a 0.743. La marca 1 le quita clientes sobre todo a la marca 2. La marca 3 casi no cambia de precio, así que su elasticidad no se puede estimar.</p>
+</div>
+
+<h2>7. Captura de valor</h2>
+<h3>7.1 Priorizar visitas</h3>
+<table>
+  <tr><th>Cupo</th><th class="n">Compra con el modelo</th><th class="n">Compra con la regla</th><th class="n">Diferencia (IC 95&nbsp;%, puntos)</th><th class="n">Captura de compras</th></tr>
+  <tr><td>5&nbsp;%</td><td class="n">68.9&nbsp;%</td><td class="n">69.1&nbsp;%</td><td class="n">−3.9 a +3.8</td><td class="n">13.7&nbsp;%</td></tr>
+  <tr><td>10&nbsp;%</td><td class="n">63.8&nbsp;%</td><td class="n">62.4&nbsp;%</td><td class="n">−0.1 a +4.0</td><td class="n">25.4&nbsp;%</td></tr>
+  <tr class="destacado"><td>20&nbsp;%</td><td class="n">51.4&nbsp;%</td><td class="n">48.4&nbsp;%</td><td class="n">+1.2 a +4.4</td><td class="n">40.9&nbsp;%</td></tr>
+  <tr><td>30&nbsp;%</td><td class="n">44.8&nbsp;%</td><td class="n">43.0&nbsp;%</td><td class="n">+1.0 a +2.9</td><td class="n">53.4&nbsp;%</td></tr>
+  <tr><td>50&nbsp;%</td><td class="n">37.0&nbsp;%</td><td class="n">34.7&nbsp;%</td><td class="n">+1.7 a +3.2</td><td class="n">73.4&nbsp;%</td></tr>
+</table>
+
+<h3>7.2 Simular el precio general</h3>
+<p>Con un margen bruto ilustrativo de 30&nbsp;%, aplicando la elasticidad de cada segmento a las visitas OOT:</p>
+<table>
+  <tr><th>Cambio de precio</th><th class="n">Compras</th><th class="n">Ingreso</th><th class="n">Margen</th></tr>
+  <tr><td>−5&nbsp;%</td><td class="n">+14.3&nbsp;%</td><td class="n">+8.1&nbsp;%</td><td class="n">−5.2&nbsp;%</td></tr>
+  <tr><td>−1&nbsp;%</td><td class="n">+2.7&nbsp;%</td><td class="n">+1.6&nbsp;%</td><td class="n">−0.8&nbsp;%</td></tr>
+  <tr><td>+1&nbsp;%</td><td class="n">−2.7&nbsp;%</td><td class="n">−1.6&nbsp;%</td><td class="n">+0.7&nbsp;%</td></tr>
+  <tr><td>+5&nbsp;%</td><td class="n">−12.7&nbsp;%</td><td class="n">−7.8&nbsp;%</td><td class="n">+2.4&nbsp;%</td></tr>
+</table>
+<p>Bajar precios gana volumen pero pierde margen. El aumento de margen con precios más altos viene de los mayores de mayor ingreso. Como la respuesta sostenida al precio parece menor que la de corto plazo, estas cifras son un límite superior de la caída de compras.</p>
+
+<h3>7.3 A quién darle un descuento de 5&nbsp;%</h3>
+<table>
+  <tr><th>Estrategia (20&nbsp;% de las visitas)</th><th class="n">Compras incrementales</th><th class="n">Compras subsidiadas</th><th class="n">Margen incremental</th></tr>
+  <tr><td>Mayor propensión</td><td class="n">113</td><td class="n">1,473</td><td class="n">−272</td></tr>
+  <tr><td>Mayor aumento de probabilidad</td><td class="n">166</td><td class="n">1,008</td><td class="n">−50</td></tr>
+  <tr class="destacado"><td>Mayor margen incremental</td><td class="n">111</td><td class="n">420</td><td class="n">+37</td></tr>
+  <tr><td>Al azar</td><td class="n">95</td><td class="n">683</td><td class="n">−66</td></tr>
+</table>
+<p>Solo gana dinero la estrategia que elige visitas de baja propensión (15.7&nbsp;%) en los segmentos sensibles al precio. La ganancia es pequeña y proviene de una elasticidad estimada, por eso debe validarse con un piloto.</p>
+
+<div class="bloque">
+<h3>7.4 Impacto por área e indicadores</h3>
+<table>
+  <tr><th>Área</th><th>Uso</th><th>Indicador de captura de valor</th><th>Cómo se mide</th></tr>
+  <tr><td>Marketing y CRM</td><td>Ofertas personalizadas por visita y por marca</td><td>Margen incremental por oferta; costo por compra incremental</td><td>Grupo de control aleatorio sin oferta (10&nbsp;% de las visitas elegibles)</td></tr>
+  <tr><td>Pricing</td><td>Nivel de precio y calendario de promociones por marca</td><td>Margen bruto de la categoría; participación por marca</td><td>Pruebas de precio por días alternados o tiendas comparables</td></tr>
+  <tr><td>Operaciones e inventario</td><td>Proyección de demanda total y por marca</td><td>Error de la proyección semanal; quiebres de stock; merma</td><td>Comparación con la proyección actual durante 8 semanas</td></tr>
+  <tr><td>Finanzas</td><td>Presupuesto de descuentos</td><td>Retorno de la inversión en descuentos</td><td>Margen incremental ÷ costo del descuento, con grupo de control</td></tr>
+  <tr><td>Ciencia de datos</td><td>Mantener los modelos vigentes</td><td>Gini, PSI del score, calibración, elasticidades</td><td>Monitoreo mensual (sección 8)</td></tr>
+</table>
+</div>
+
+<div class="bloque">
+<h2>8. Monitoreo y cronograma</h2>
+<div class="dos">
+<table>
+  <tr><th>Indicador</th><th>Frecuencia</th><th>Acción</th></tr>
+  <tr><td>PSI del score</td><td>Mensual</td><td>&gt; 0.25: reentrenar</td></tr>
+  <tr><td>Gini del último mes</td><td>Mensual</td><td>&lt; 0.30: revisar variables</td></tr>
+  <tr><td>Sesgo de demanda semanal</td><td>Semanal</td><td>&gt; 10&nbsp;%: recalibrar</td></tr>
+  <tr><td>Elasticidad por segmento</td><td>Trimestral</td><td>Cambio de signo: reestimar</td></tr>
+  <tr><td>Margen del tratado frente al control</td><td>Por campaña</td><td>&lt; 0: suspender la oferta</td></tr>
+</table>
+<table>
+  <tr><th>Semana</th><th>Fase</th></tr>
+  <tr><td>1</td><td>Entendimiento y calidad de datos</td></tr>
+  <tr><td>2</td><td>Análisis exploratorio y variables</td></tr>
+  <tr><td>3 a 4</td><td>Modelos, elasticidad y elección de marca</td></tr>
+  <tr><td>5</td><td>Despliegue piloto y tablero</td></tr>
+  <tr><td>6 a 13</td><td>Piloto con grupo de control y decisión de escalar</td></tr>
+</table>
+</div>
+</div>
+
+<h2>9. Limitaciones</h2>
+<ul>
+  <li><b>La elasticidad es de corto plazo</b> y exagera el efecto de un cambio sostenido. El precio no fue asignado al azar.</li>
+  <li><b>Propensión no es efecto causal.</b> El margen incremental de los descuentos combina dos modelos y debe validarse con un grupo de control.</li>
+  <li><b>La elección del modelo no es ciega.</b> La regla que limita la elección a modelos con variables seleccionadas se definió después de una primera corrida, en la que la regla anterior elegía al campeón (Gini OOT de 0.405). XGBoost se agregó como retador en una revisión posterior, cuando ya se sabía que fuera de tiempo rendía igual que LightGBM; la regla lo eligió por una diferencia de 0.003 que es ruido.</li>
+  <li><b>Siempre son los mismos 500 clientes.</b> La prueba con 100 clientes no vistos es alentadora, pero pequeña.</li>
+  <li><b>Equidad.</b> El modelo ordena peor entre los jóvenes de menor ingreso (Gini 0.351), que reciben 14.3&nbsp;% de las ofertas.</li>
+  <li><b>Sin cantidad.</b> No se modelan las unidades por compra. La marca 3 no es identificable para pricing.</li>
+  <li><b>Valores ilustrativos.</b> El margen de 30&nbsp;% y el descuento de 5&nbsp;% no provienen de la tienda.</li>
+</ul>
+
+<h2>10. Reproducibilidad</h2>
+<p>Todo el análisis está en <code>nb_01_propension_elasticidad.ipynb</code>. Se ejecuta de principio a fin en unos tres minutos con Python 3.14 y, con <code>SEMILLA = 42</code>, reproduce todas las cifras de este documento. Las dependencias, con sus versiones exactas, están en <code>requirements_purchase-propensity-price-elasticity.txt</code>.</p>
+<pre>
+python -m venv venv-purchase-propensity-price-elasticity
+.\venv-purchase-propensity-price-elasticity\Scripts\python.exe -m pip install -r requirements_purchase-propensity-price-elasticity.txt
+# Copiar compras_data.csv en data/, abrir el notebook con ese kernel y ejecutar todas las celdas
+</pre>
+<p>Librerías: pandas, NumPy, scikit-learn, LightGBM, XGBoost, joblib y Matplotlib.</p>
+
+</body>
+</html>
